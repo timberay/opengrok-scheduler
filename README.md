@@ -11,6 +11,9 @@
   - **Network**: 인터페이스 속도 자동 감지 및 실시간 대역폭 사용률 계산
   - **Disk I/O**: `iostat` %util 및 Blocked Process 상태를 종합하여 검사
 - **SQLite3 기반 관리**: 서비스 목록, 스케줄러 설정, 작업 로그 및 상태를 SQLite3 DB로 통합 관리
+- **비동기 백그라운드 실행**: 인덱싱 작업을 백그라운드로 실행하여 여러 작업을 동시에 수행 가능 (리소스 상태에 따라 동적 시작)
+- **고정 실행 간격 보장**: 작업 유무와 관계없이 설정된 `check_interval` 주기를 엄격히 준수하여 규칙적인 스캔 수행
+- **SQLite3 동시성 최적화**: WAL(Write-Ahead Logging) 모드 및 Busy Timeout(10초)을 적용하여 다중 프로세스 접근 시 DB Lock 방지
 - **상태 리포팅**: `--status` 명령어를 통해 처리 현황, 시작 시간, 소요 시간, 결과 등을 콘솔에 출력
 - **독립적 구동**: 스케줄러가 백그라운드에서 실행 중이더라도 별도 세션에서 상태 확인 가능
 
@@ -81,7 +84,7 @@ chmod +x bin/*.sh
 | `start_time` | 작업 시작 가능 시간 | `18:00` |
 | `end_time` | 작업 종료 시간 | `06:00` |
 | `resource_threshold` | 리소스 임계치 (%) | `70` |
-| `check_interval` | 상태 체크 주기 (초) | `300` |
+| `check_interval` | 상태 체크 및 다음 작업 검색 주기 (초, 작업 유무와 상관없이 고정 대기) | `300` |
 | `net_interface` | 모니터링 인터페이스 (자동 감지 가능) | - |
 | `max_bandwidth` | 최대 대역폭 (Bytes/s, 속도 감지 실패 시 사용) | - |
 | `disk_device` | I/O 모니터링 대상 디스크 (자동 감지 가능) | - |
@@ -97,4 +100,5 @@ chmod +x bin/*.sh
 ./tests/test_monitor.sh           # 리소스 모니터링 엔진 테스트
 ./tests/test_scheduler_logic.sh   # 시간대 및 대기 로직 테스트
 ./tests/test_status_output.sh     # CLI 출력 포맷 테스트
+./tests/test_db_stress.sh        # DB 동시성 및 안정성 스트레스 테스트
 ```

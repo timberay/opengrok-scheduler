@@ -36,3 +36,10 @@
 - [x] 모니터링 임계치 상세 조정 및 검증
 - [x] **Feature**: 당일 작업 초기화 (`--init`) 옵션 구현
 - [x] **Test**: `--init` 실행 후 스케줄러 재시작 동작 검증
+- [x] **Feature**: 인덱싱 작업 단순 비동기 실행 및 고정 실행 간격(Interval) 보장
+  - [x] 작업 유무에 관계없이 DB에 설정된 `check_interval`만큼 반드시 대기
+  - [x] `run_indexing_task` 백그라운드 실행 (별도 개수 제한 없음)
+- [x] **Stabilization**: SQLite 동시성 최적화 (WAL & Busy Timeout)
+  - [x] `db_query.sh`에 `busy_timeout` 및 `WAL` 모드 적용
+  - [x] 고부하 동시 쓰기 상황(Stress Test) 시나리오 작성
+  - [x] 에러 발생 없을 때까지 반복 테스트 및 검증

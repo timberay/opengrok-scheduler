@@ -163,44 +163,36 @@ if [[ "$1" != "--no-run" ]]; then
         # 1. Load Config
         START_TIME=$($DB_QUERY "SELECT value FROM config WHERE key='start_time';")
         END_TIME=$($DB_QUERY "SELECT value FROM config WHERE key='end_time';")
-        THRESHOLD=$($DB_QUERY "SELECT value FROM config WHERE key='resource_threshold';")
-        INTERVAL=$($DB_QUERY "SELECT value FROM config WHERE key='check_interval';")
-        
         # 2. Check Time Range
         if ! check_time_range "$START_TIME" "$END_TIME" > /dev/null; then
             log "Outside working hours ($START_TIME ~ $END_TIME). Sleeping..."
-            sleep "$INTERVAL"
-            continue
+        else
+            # 3. Check Resources
+            CPU=$(get_cpu_usage)
+            MEM=$(get_mem_usage)
+            DISK=$(get_disk_usage "/")
+            DISKIO=$(get_diskio_usage)
+            NET=$(get_bandwidth_usage)
+            PROC=$(get_proc_usage)
+            
+            if ! check_thresholds "$CPU" "$MEM" "$DISK" "$DISKIO" "$NET" "$PROC" "$THRESHOLD"; then
+                log "Resource limit exceeded: $LAST_BYPASS_REASON. Waiting..."
+            else
+                # 4. Get Next Job
+                NEXT_SERVICE_ID=$($DB_QUERY "SELECT s.id FROM services s LEFT JOIN jobs j ON s.id = j.service_id AND j.start_time > datetime('now', '-20 hours') WHERE s.is_active=1 AND (j.status IS NULL OR j.status='FAILED') ORDER BY s.priority DESC LIMIT 1;")
+                
+                if [ -z "$NEXT_SERVICE_ID" ]; then
+                    log "All tasks completed for today. Waiting..."
+                else
+                    CONTAINER_NAME=$($DB_QUERY "SELECT container_name FROM services WHERE id=$NEXT_SERVICE_ID;")
+                    # 5. Execute Job (Simple Background)
+                    run_indexing_task "$NEXT_SERVICE_ID" "$CONTAINER_NAME" &
+                fi
+            fi
         fi
         
-        # 3. Check Resources
-        CPU=$(get_cpu_usage)
-        MEM=$(get_mem_usage)
-        DISK=$(get_disk_usage "/") # Should be opengrok data path in prod
-        DISKIO=$(get_diskio_usage)
-        NET=$(get_bandwidth_usage)
-        PROC=$(get_proc_usage)
-        
-        if ! check_thresholds "$CPU" "$MEM" "$DISK" "$DISKIO" "$NET" "$PROC" "$THRESHOLD"; then
-            log "Resource limit exceeded: $LAST_BYPASS_REASON. Waiting..."
-            sleep "$INTERVAL"
-            continue
-        fi
-        
-        # 4. Get Next Job
-        # Find a service that hasn't been completed within the last 20 hours
-        NEXT_SERVICE_ID=$($DB_QUERY "SELECT s.id FROM services s LEFT JOIN jobs j ON s.id = j.service_id AND j.start_time > datetime('now', '-20 hours') WHERE s.is_active=1 AND (j.status IS NULL OR j.status='FAILED') ORDER BY s.priority DESC LIMIT 1;")
-        
-        if [ -z "$NEXT_SERVICE_ID" ]; then
-            log "All tasks completed for today. Sleeping..."
-            sleep "$INTERVAL"
-            continue
-        fi
-        
-        CONTAINER_NAME=$($DB_QUERY "SELECT container_name FROM services WHERE id=$NEXT_SERVICE_ID;")
-        
-        # 5. Execute Job
-        run_indexing_task "$NEXT_SERVICE_ID" "$CONTAINER_NAME"
+        # Always sleep for the interval regardless of task execution
+        sleep "$INTERVAL"
         
     done
 fi

@@ -13,4 +13,11 @@ fi
 
 # Execute Query
 # Usage: ./db_query.sh "SELECT * FROM services"
-sqlite3 "$DB_PATH" "$1"
+# Execute Query with Concurrency Optimizations
+# Execute Query with Concurrency Optimizations
+# We run PRAGMAs and the query, but filter out PRAGMA results (wal, 10000, etc.)
+# A cleaner way: Use a temporary init file and redirect its output to stderr
+INIT_FILE=$(mktemp)
+echo "PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL;" > "$INIT_FILE"
+sqlite3 -batch -init "$INIT_FILE" "$DB_PATH" "$1" 2>/dev/null | grep -vE "^(wal|[0-9]{5})$"
+rm -f "$INIT_FILE"
