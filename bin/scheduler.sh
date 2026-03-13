@@ -59,7 +59,7 @@ run_indexing_task() {
 
     log "Starting indexing for $CONTAINER_NAME..."
     # Insert and get ID in the same session
-    local JOB_ID=$($DB_QUERY "INSERT INTO jobs (service_id, status, start_time) VALUES ($SERVICE_ID, 'RUNNING', datetime('now')); SELECT last_insert_rowid();")
+    local JOB_ID=$($DB_QUERY "INSERT INTO jobs (service_id, status, start_time) VALUES ($SERVICE_ID, 'RUNNING', datetime('now', 'localtime')); SELECT last_insert_rowid();")
     
     local START_SEC=$(date +%s)
     
@@ -81,10 +81,10 @@ run_indexing_task() {
     local DURATION=$((END_SEC - START_SEC))
     
     if [ "$EXIT_CODE" -eq 0 ]; then
-        $DB_QUERY "UPDATE jobs SET status='COMPLETED', end_time=datetime('now'), duration=$DURATION WHERE id=$JOB_ID;"
+        $DB_QUERY "UPDATE jobs SET status='COMPLETED', end_time=datetime('now', 'localtime'), duration=$DURATION WHERE id=$JOB_ID;"
         log "Indexing $CONTAINER_NAME completed successfully."
     else
-        $DB_QUERY "UPDATE jobs SET status='FAILED', end_time=datetime('now'), duration=$DURATION, message='Exit code $EXIT_CODE' WHERE id=$JOB_ID;"
+        $DB_QUERY "UPDATE jobs SET status='FAILED', end_time=datetime('now', 'localtime'), duration=$DURATION, message='Exit code $EXIT_CODE' WHERE id=$JOB_ID;"
         log "Indexing $CONTAINER_NAME failed."
     fi
     return $EXIT_CODE
@@ -104,7 +104,7 @@ if [[ "$1" != "--no-run" ]]; then
         QUERY="SELECT s.container_name, j.status, j.start_time, j.duration, j.message 
                FROM services s 
                LEFT JOIN jobs j ON s.id = j.service_id 
-               WHERE (j.start_time > datetime('now', '-20 hours') OR j.start_time IS NULL)
+               WHERE (j.start_time > datetime('now', 'localtime', '-20 hours') OR j.start_time IS NULL)
                ORDER BY j.start_time DESC LIMIT 50;"
         
         $DB_QUERY "$QUERY" | while IFS='|' read -r name status start duration msg; do
@@ -115,7 +115,7 @@ if [[ "$1" != "--no-run" ]]; then
         echo "--------------------------------------------------------------------------------"
         
         TOTAL=$($DB_QUERY "SELECT count(*) FROM services;")
-        DONE=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='COMPLETED' AND start_time > datetime('now', '-20 hours');")
+        DONE=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='COMPLETED' AND start_time > datetime('now', 'localtime', '-20 hours');")
         echo "Total: $TOTAL | Done (Last 20h): $DONE"
         exit 0
     fi
@@ -124,13 +124,13 @@ if [[ "$1" != "--no-run" ]]; then
     if [[ "$1" == "--init" ]]; then
         log "Initializing today's job status (20h window)..."
         # Check if any job is currently RUNNING within 20h
-        RUNNING_JOBS=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='RUNNING' AND start_time > datetime('now', '-20 hours');")
+        RUNNING_JOBS=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='RUNNING' AND start_time > datetime('now', 'localtime', '-20 hours');")
         if [ "$RUNNING_JOBS" -gt 0 ]; then
             log "[Warning] There are $RUNNING_JOBS jobs currently in 'RUNNING' status."
             log "Force initializing anyway..."
         fi
         
-        $DB_QUERY "DELETE FROM jobs WHERE start_time > datetime('now', '-20 hours');"
+        $DB_QUERY "DELETE FROM jobs WHERE start_time > datetime('now', 'localtime', '-20 hours');"
         log "Recent job records (last 20h) have been cleared."
         exit 0
     fi
@@ -187,7 +187,7 @@ if [[ "$1" != "--no-run" ]]; then
                        AND NOT EXISTS (
                            SELECT 1 FROM jobs j 
                            WHERE j.service_id = s.id 
-                           AND j.start_time > datetime('now', '-20 hours') 
+                           AND j.start_time > datetime('now', 'localtime', '-20 hours') 
                            AND j.status IN ('RUNNING', 'COMPLETED')
                        )
                        ORDER BY s.priority DESC LIMIT 1;"
