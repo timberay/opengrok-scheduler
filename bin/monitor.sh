@@ -158,17 +158,22 @@ LAST_BYPASS_REASON=""
 # Return: 0 if all safe, 1 if any exceeds
 check_thresholds() {
     local CPU=$1; local MEM=$2; local DISK=$3; local DISKIO=$4; local NET=$5; local PROC=$6; local LIMIT=$7
+    local REASONS=()
+    
+    if [ "$CPU" -gt "$LIMIT" ]; then REASONS+=("CPU ${CPU}%"); fi
+    if [ "$MEM" -gt "$LIMIT" ]; then REASONS+=("Memory ${MEM}%"); fi
+    if [ "$DISK" -gt "$LIMIT" ]; then REASONS+=("Disk ${DISK}%"); fi
+    if [ "$DISKIO" -gt "$LIMIT" ]; then REASONS+=("Disk I/O ${DISKIO}%"); fi
+    if [ "$NET" -gt "$LIMIT" ]; then REASONS+=("Network ${NET}%"); fi
+    if [ "$PROC" -gt "$LIMIT" ]; then REASONS+=("Process Score ${PROC}"); fi
+    
+    if [ ${#REASONS[@]} -gt 0 ]; then
+        # Join reasons with comma and include the limit
+        local JOINED=$(IFS=', '; echo "${REASONS[*]}")
+        LAST_BYPASS_REASON="$JOINED (Limit: ${LIMIT})"
+        return 1
+    fi
+    
     LAST_BYPASS_REASON=""
-    
-    # Check CPU, MEM, DISK, DISKIO, NET
-    if [ "$CPU" -gt "$LIMIT" ]; then LAST_BYPASS_REASON="CPU (${CPU}%)"; return 1; fi
-    if [ "$MEM" -gt "$LIMIT" ]; then LAST_BYPASS_REASON="Memory (${MEM}%)"; return 1; fi
-    if [ "$DISK" -gt "$LIMIT" ]; then LAST_BYPASS_REASON="Disk (${DISK}%)"; return 1; fi
-    if [ "$DISKIO" -gt "$LIMIT" ]; then LAST_BYPASS_REASON="Disk I/O (${DISKIO}%)"; return 1; fi
-    if [ "$NET" -gt "$LIMIT" ]; then LAST_BYPASS_REASON="Network (${NET}%)"; return 1; fi
-    
-    # Logic for Process count is a bit tricky
-    if [ "$PROC" -gt "$LIMIT" ]; then LAST_BYPASS_REASON="Process Score ($PROC)"; return 1; fi
-    
     return 0
 }
