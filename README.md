@@ -1,52 +1,61 @@
-# OpenGrok Helper
+# OpenGrok Index Scheduler
 
-This is a smart helper for your computer! It helps many "service boxes" (called OpenGrok) stay organized. It makes sure they do their work only when the computer is not busy and when it is nighttime.
+This is a Bash-based helper that organizes indexing for more than 70 OpenGrok service boxes. It checks how busy the computer is and works only when there is enough room and during the night.
 
-## What It Does
+## Main Features
 
-- **Night Worker**: It only starts work at night (like from 6:00 PM to 6:00 AM) so it doesn't slow you down during the day.
-- **Smart Listener**: It checks a list every few minutes to see if you changed any rules. You don't have to restart it!
-- **Body Check**: 
-  - **Brain (CPU)**: It checks how hard the computer's brain is working.
-  - **Memory (RAM)**: It checks if there is enough space for the computer to think.
-  - **Internet**: It checks if the internet is too busy.
-  - **Disk**: It checks if the computer is busy reading or writing files.
-- **Good Memory**: It uses a small notebook (called SQLite3) to remember which boxes finished their work and which ones are still waiting.
-- **Helper Team**: It can help many boxes at the same time if the computer feels strong enough!
-- **Friendly Reports**: It can tell you a summary of what it did if you ask for its "status."
+- **Time-Based Work**: It only works during the hours you set (like 18:00 to 06:00).
+- **Live Settings**: It reads the rules from the notebook (SQLite3) every time it checks, so you don't have to restart it to change rules.
+- **Body Check (Resource Monitoring)**: 
+  - **Brain (CPU)**: It checks how hard the brain is working right now.
+  - **Thinking Space (Memory)**: It looks at the real space left for thinking (available memory).
+  - **Internet (Network)**: It detects the speed and checks how much is being used.
+  - **Disk I/O**: It checks if the computer is busy reading or writing books (files).
+- **Process Usage**: it counts how many other programs are running or waiting.
+- **Notebook Management (SQLite3)**: It keeps the list of boxes, rules, and history in a small notebook file.
+- **Background Work**: It can start indexing tasks in the background so it can do more than one thing at a time.
+- **Fixed Checking Time**: It follows a strict schedule (like every 5 minutes) to scan for new tasks.
+- **Safe Notebook**: It uses special tricks (WAL and Busy Timeout) so many programs can talk to the notebook at the same time without problems.
+- **Status Reports**: Use the `--status` command to see a summary of what has been done.
+- **Independent Checking**: You can check the status even while the helper is working in the background.
 
-## Where Things Are
+## Project Structure
 
 ```text
 opengrok-scheduler/
-├── bin/                # The tools and scripts (The brains)
-├── sql/                # The layout for the notebook
-├── data/               # Where the notebook is kept
-├── tests/              # Games to check if the tools work right
-├── logs/               # A diary of everything the helper did
+├── bin/
+│   ├── scheduler.sh    # The main brain and command center
+│   ├── monitor.sh      # The body check tool
+│   └── db_query.sh     # The tool for talking to the notebook
+├── sql/
+│   └── init_db.sql     # The original layout for the notebook
+├── data/
+│   └── scheduler.db    # The notebook file itself
+├── tests/              # Games and tests to check if everything works
+├── logs/               # A diary of every action the helper takes
 ├── README.md           # This guide
-├── ARCHITECTURE.md     # A big map of how it works
-└── TASK.md             # A checklist of things to do
+├── ARCHITECTURE.md     # A big map of how it all works
+└── TASK.md             # A checklist of what we have done
 ```
 
-## How to Start
+## How to Get Started
 
 ### 1. What You Need
-- A Linux computer
-- Some special tools (SQLite3, sysstat)
-- Docker (The boxes)
+- Bash Shell (A special way to talk to Linux)
+- SQLite3 and sysstat (Tools for the helper to work)
+- Docker (The boxes that need indexing)
 
-### 2. Make the Notebook
-Run this to make the diary and notebook:
+### 2. Make the notebook
 ```bash
 mkdir -p data logs
 sqlite3 data/scheduler.db < sql/init_db.sql
 ```
 
 ### 3. Add Your Boxes
-Tell the helper which boxes need to be organized:
+Add the names of the boxes you want to organize:
 ```bash
 ./bin/db_query.sh "INSERT INTO services (container_name, priority) VALUES ('box-1', 10);"
+./bin/db_query.sh "INSERT INTO services (container_name, priority) VALUES ('box-2', 5);"
 ```
 
 ### 4. Start the Helper!
@@ -55,41 +64,49 @@ chmod +x bin/*.sh
 ./bin/scheduler.sh
 ```
 
-## Fun Commands
+## How to Use It
 
-### Do One Now! (--service)
-If you want one box to finish right now, ask nicely:
+### Run One Box Now (--service)
+If you want to start one box right away, no matter what time it is:
 ```bash
 ./bin/scheduler.sh --service box-1
 ```
 
-### How Are We Doing? (--status)
-Ask the helper to show you a report:
+### Check the Status (--status)
+See a summary of what the helper is doing:
 ```bash
 ./bin/scheduler.sh --status
 ```
 
-### Start Over (--init)
-If you want to clear today's diary and start fresh:
+### Start Fresh (--init)
+Clear the diary for the last 23 hours:
 ```bash
 ./bin/scheduler.sh --init
 ```
 
-## Rules You Can Change
+### Changing the Rules
+You can change rules in the `config` table of the notebook.
 
-The helper looks at its notebook for these rules:
-
-| Rule Name | What It Is | Normal Setting |
+| Rule Name | What It Is | Default |
 |:---|:---|:---|
-| `start_time` | When to start working | `18:00` (6 PM) |
-| `end_time` | When to stop working | `06:00` (6 AM) |
+| `start_time` | When work begins | `18:00` |
+| `end_time` | When work ends | `06:00` |
 | `resource_threshold` | How busy the computer can be (%) | `70` |
-| `check_interval` | How long to wait before checking again (seconds) | `300` (5 mins) |
+| `check_interval` | How long to wait between checks (seconds) | `300` |
+| `net_interface` | Which internet pipe to watch | - |
+| `max_bandwidth` | Max speed of the internet | - |
+| `disk_device` | Which disk to watch | - |
 
-## Testing
-
-If you want to play and see if it works, try these:
 ```bash
-./tests/test_monitor.sh           # Check if it can feel the computer's body
-./tests/test_scheduler_logic.sh   # Check if it knows what time it is
+# Change the limit to 80%
+./bin/db_query.sh "UPDATE config SET value='80' WHERE key='resource_threshold';"
+```
+
+## Running Tests
+Run these games to make sure the helper is working:
+```bash
+./tests/test_monitor.sh           # Check the body check tool
+./tests/test_scheduler_logic.sh   # Check the time and waiting rules
+./tests/test_status_output.sh     # Check the status reports
+./tests/test_db_stress.sh        # Check if the notebook is safe
 ```

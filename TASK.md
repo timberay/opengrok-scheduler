@@ -1,58 +1,65 @@
-# Things for the Helper to Do
+# Implementation Tasks (TDD & E2E Focused)
 
-## Rules for Coding: Be a Good Student!
+## Coding Rules: Be a Good Student!
 
-**Follow these steps every time you write code:**
+**Write all code in this order: Red → Green → Refactor.**
 
-1. **Wait (Red)**: Write a test that fails first.
-2. **Go (Green)**: Write just enough code to make the test pass.
-3. **Clean Up (Refactor)**: Make the code look nice and tidy while the test still passes.
+1. **Red**: Write a test that fails first and run it.
+2. **Green**: Write the smallest amount of code to make the test pass.
+3. **Refactor**: Clean up the code while the test still passes.
 
-Never write code without a test! Take tiny "baby steps" one at a time.
+Never write code without a test! Only make one small change at a time (Baby Steps).
+When adding a new phase, you must add **Test** and **E2E** items to the list.
 
 ---
 
-## Part 1: Setting up the Home
-- [x] **Test**: Check if the notebook and rules work.
-- [x] Make the folders for the brains and diary.
-- [x] Write the first rules for the notebook.
-- [x] Make a tool to talk to the notebook.
-- [x] **Check**: See if we can read and write in the notebook.
+## Phase 1: Environment & Database Setup
+- [x] **Test**: Write test code for making the notebook (schema) and adding initial rules.
+- [x] Create the project folders (bin, logs, sql).
+- [x] Write the notebook setup script (`init_db.sql`).
+  - [x] Create `config`, `services`, and `jobs` tables.
+- [x] Write the special tool for talking to the notebook (`db_query.sh`).
+- [x] **E2E**: Check if the notebook initializes and basic queries work.
 
-## Part 2: Feeling Checks
-- [x] **Test**: Pretend the computer is too tired and see if the helper notices.
-- [x] Teach the helper how to check the brain, memory, and disk.
-- [x] Make a rule to stop if the computer is 70% tired.
-- [x] **Check**: Make sure the helper can feel the computer's body.
+## Phase 2: Resource Monitoring Module
+- [x] **Test**: Write tests for when the computer is too tired (CPU 100%, Disk Full, etc.).
+- [x] Teach the helper to calculate Brain (CPU), Space (Memory), Disk, and Process usage.
+- [x] Write the main body check function (check 70% limit).
+- [x] **E2E**: Check if the helper can read real computer stats and judge the limits.
 
-## Part 3: The Main Helper Brain
-- [x] **Test**: Check if the helper stays awake at night and sleeps during the day.
-- [x] Teach the helper when to work based on the clock.
-- [x] Make the helper keep checking the notebook every 5 minutes.
-- [x] **Check**: See if a fake box can finish its work.
+## Phase 3: Scheduler Core Logic
+- [x] **Test**: Write tests for working during the night and sleeping during the day.
+- [x] Teach the helper to decide whether to work based on the clock.
+- [x] Create the main loop (runs every 5 minutes) and the box-turn logic.
+- [x] **E2E**: Check the whole scheduling flow using fake boxes (Docker).
 
-## Part 4: Talking to Us
-- [x] **Test**: Make sure the helper shows the right report for different stories.
-- [x] Teach the helper how to show its status.
-- [x] **Check**: Ask the helper for its status while it is working.
+## Phase 4: CLI Interface (`--status`)
+- [x] **Test**: Check if the reports look right for different stories (Waiting, Running, Done, Failed).
+- [x] Make the `--status` command show a summary report.
+- [x] **E2E**: Ask for the status report while the helper is working and check if it's correct.
 
-## Part 5: Final Checkup
-- [x] Test everything with many fake boxes at once.
-- [x] Make sure the helper waits if the computer gets very busy.
-- [x] Test what happens if the computer or the notebook has a problem.
+## Phase 5: Final Verification
+- [x] Run a big integration test with 70 fake boxes.
+- [x] Check if the helper waits correctly when the computer is very busy.
+- [x] Test if the helper can recover from problems (DB Lock, Docker errors).
 
-## Part 6: Making It Better
-- [x] **Test**: Check if the helper can count busy programs correctly.
-- [x] Teach the helper more ways to see if the computer is busy.
-- [x] Adjust the rules to make them perfect.
-- [x] **New**: Add a way to start fresh for the day (`--init`).
-- [x] **Test**: Check if starting fresh works.
-- [x] **New**: Make the helper work on many boxes at once but keep waiting properly.
-- [x] **Safety**: Make the notebook even safer so the helper doesn't lose notes.
+## Phase 6: Maintenance & Enhancement
+- [x] **Test**: Check the math for counting busy programs using `/proc`.
+- [x] Make the process monitoring better using `/proc/stat` and `/proc/loadavg`.
+- [x] Fine-tune the body check limits and verify them.
+- [x] **Feature**: Add a way to start fresh for the day (`--init`).
+- [x] **Test**: Check if starting fresh works and the helper restarts correctly.
+- [x] **Feature**: Let the helper start tasks in the background and keep a fixed waiting time.
+  - [x] Always wait for the `check_interval` time even if there is no work.
+  - [x] Run indexing tasks in the background (no limit on count).
+- [x] **Stabilization**: Make the notebook safe for many programs (WAL & Busy Timeout).
+  - [x] Add `busy_timeout` and `WAL` mode to `db_query.sh`.
+  - [x] Write a stress test to write to the notebook many times at once.
+  - [x] Test again and again until there are no errors.
 
-## Part 7: Better Reports
-- [x] **Test**: Check if the reports look nice.
-- [x] Make thestatus report easier to read.
-- [x] Show more details if the computer is too tired.
-- [x] Make the helper remember things for 23 hours.
-- [x] **Check**: Verify the reports match the diary perfectly.
+## Phase 7: Monitoring & UI Enhancement
+- [x] **Test**: Write tests for when limits are crossed and columns are mapped correctly.
+- [x] Remove the extra `Result` column and map everything to the `Message` field.
+- [x] Show more details in the diary when the computer is too tired.
+- [x] Change the memory window from 20 hours to 23 hours everywhere.
+- [x] **E2E**: Check if the diary and reports match real-life busy moments.

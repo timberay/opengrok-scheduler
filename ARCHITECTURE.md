@@ -1,54 +1,77 @@
-# How the OpenGrok Helper Works
+# OpenGrok Index Scheduler Architecture
 
-This page tells you how the helper module is built and how it stays smart.
+This is the detailed design for the Bash-based helper that manages OpenGrok indexing.
 
-## 1. What is it?
-The OpenGrok Helper is like a teacher for many computer boxes. It makes sure each box finishes its work at the right time (usually at night) without making the computer too tired.
+## 1. Overview
+This tool helps manage many OpenGrok boxes. It runs them one by one during the night (18:00 to 06:00). It also checks if the computer is too tired (CPU, Memory, Disk, and Processes) to make sure everything runs smoothly.
 
-## 2. Cool Features
-- **Time Watcher**: It knows when to work and when to sleep.
-- **Feeling Checks**: 
-  - **Brain (CPU)**: Checks if the "brain" is thinking too hard right now.
-  - **Memory**: Checks if there is enough "thinking space" left.
-  - **Internet**: Checks if the "internet pipe" is too full.
-  - **Busy Score**: Checks if there are too many other programs running.
-- **Fair Turns**: It makes sure every box gets a turn to work based on how long it usually takes.
-- **Diary**: It writes down everything it does in a notebook so you can read it later.
+## 2. Main Features
+- **Time Watcher**: It only runs during the lucky hours you pick (like at night).
+- **Body Check (Resource Monitoring)**: 
+  - **Brain (CPU)**: It checks how busy the computer's brain is right now.
+  - **Thinking Space (Memory)**: It makes sure there is enough room to think, excluding temporary notes (cache).
+  - **Internet (Network)**: It checks how fast the internet pipe is moving.
+  - **Busy Score (Process)**: it counts how many other programs are running or waiting.
+- **Fair Turns**: It runs many boxes in order based on their priority in the notebook.
+- **Diary (Logging)**: It writes everything down in a notebook (SQLite3) and a log file.
+- **Status Report**: You can ask for a summary using the `--status` command.
 
-## 3. The Tools It Uses
-- **Language**: Bash (The secret code for computers)
-- **Notebook**: SQLite3 (A tiny but very fast book to remember things)
-- **Boxes**: Docker (Where the work actually happens)
+## 3. Tools We Use
+- **Language**: Bash Script
+- **Notebook (Database)**: SQLite3
+- **Boxes**: Docker CLI
+- **Measuring Tools**: `top`, `free`, `iostat`, `/proc/net/dev`, `/sys/class/net/`
 
-## 4. The Notebook (Database)
+## 4. Notebook Design (SQLite3)
 
 ### 4.1 Rules Table (`config`)
-This is where the helper reads the rules, like "Work begins at 6 PM."
+This table holds the rules for the helper.
+- `id`: Row number
+- `key`: The name of the rule (like 'start_time' or 'resource_threshold')
+- `value`: What the rule is set to
 
 ### 4.2 Boxes Table (`services`)
-This is a list of all the boxes the helper needs to look after.
+This is the list of boxes to work on.
+- `id`: Row number
+- `container_name`: The name of the box
+- `priority`: How important this box is (higher number means it goes sooner)
+- `is_active`: Is this box ready to work? (1: Yes, 0: No)
 
 ### 4.3 Work Table (`jobs`)
-This is where the helper writes down when a box started and finished its work.
+This is where the helper writes down what happened.
+- `id`: Row number
+- `service_id`: Which box was working
+- `status`: How it's doing ('WAITING', 'RUNNING', 'COMPLETED', 'FAILED')
+- `start_time`: When it started
+- `end_time`: When it finished
+- `duration`: How many seconds it took
+- `message`: Extra notes (like if there was a problem)
 
-## 5. How It Thinks (The Big Loop)
+## 5. How Corporate Brain Works (The Algorithm)
 
-### 5.1 The Main Plan
+### 5.1 The Main Loop
 1. Read the rules from the notebook.
-2. Check the clock. If it's too early or too late, go back to sleep.
-3. Check the computer's body. If it's too tired (like the brain is at 70%), wait for a bit.
-4. Look for the next box that needs help. It picks the one that usually takes the most time!
-5. Start the work and write it down in the diary.
+2. Check the clock. Is it time to work? If not, wait and check again.
+3. Check the computer's body. If any measurement is too high (above the limit), wait.
+4. Look for the next box that needs help (not worked in the last 23 hours).
+    - It picks the box that usually takes the most time first (Longest Job First).
+5. Start the work and update the notebook when finished.
 
-### 5.2 Looking at Feelings
-- **Brain**: It looks at how busy the brain is right now.
-- **Memory**: It looks at how much space is left for new thoughts.
-- **Disk**: It looks at how busy the computer is reading books (files).
-- **Internet**: It looks at how fast the internet is moving.
+### 5.2 Measuring Details
+- **Brain (CPU)**: Checks the "idle" time to see how busy the brain is right now.
+- **Memory**: Checks how much "available" space is left compared to the total.
+- **Disk I/O**: Uses `iostat` to see how busy the computer is reading books.
+- **Internet**: Checks the speed of the internet interface.
+- **Busy Score**: Checks how many programs are "running" or "blocked."
 
-## 6. Asking the Helper
-You can ask the helper, "How are you doing?" by typing `--status`. It will show you a list of boxes and if they are done or still waiting.
+## 6. How to Talk to It (CLI)
 
-## 7. Special Tricks
-- **Language Help**: It understands many languages so it doesn't get confused by different words.
-- **Safe Writing**: It is very careful when writing in its notebook so it doesn't lose any information.
+### 6.1 Status Command
+You can ask for a report anytime.
+- It shows each box's status, start time, how long it took, and the result.
+- It shows how many boxes are finished out of the total for the last 23 hours.
+
+## 7. Being Careful (Exception Handling)
+- **Different Languages**: The helper understands computer measurements even if the computer speaks different languages.
+- **Internet Speed**: If it can't find the internet speed, it uses a safe guess (100Mbps).
+- **Safe Notebook**: It is very careful when writing in the notebook so it doesn't get stuck (DB Lock).
