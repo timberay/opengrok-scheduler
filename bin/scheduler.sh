@@ -183,6 +183,12 @@ if [[ "$1" != "--no-run" ]]; then
             else
                 # 4. Get Next Job (Exclude services already RUNNING or COMPLETED today)
                 QUERY="SELECT s.id FROM services s 
+                       LEFT JOIN (
+                           SELECT service_id, AVG(duration) as avg_duration 
+                           FROM jobs 
+                           WHERE status='COMPLETED' 
+                           GROUP BY service_id
+                       ) j_stats ON s.id = j_stats.service_id
                        WHERE s.is_active=1 
                        AND NOT EXISTS (
                            SELECT 1 FROM jobs j 
@@ -190,7 +196,8 @@ if [[ "$1" != "--no-run" ]]; then
                            AND j.start_time > datetime('now', 'localtime', '-23 hours') 
                            AND j.status IN ('RUNNING', 'COMPLETED')
                        )
-                       ORDER BY s.priority DESC LIMIT 1;"
+                       ORDER BY COALESCE(j_stats.avg_duration, -1) DESC, s.container_name ASC 
+                       LIMIT 1;"
                 NEXT_SERVICE_ID=$($DB_QUERY "$QUERY")
                 
                 if [ -z "$NEXT_SERVICE_ID" ]; then
