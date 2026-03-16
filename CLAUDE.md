@@ -1,1 +1,0 @@
-/home/tonny/.agents/AGENTS.md

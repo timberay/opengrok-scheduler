@@ -12,3 +12,9 @@ bin/*.log
 tmp/
 .DS_Store
 *.swp
+
+# AI Agent configurations and skills
+.agent/
+.claude/
+AGENTS.md
+CLAUDE.md
