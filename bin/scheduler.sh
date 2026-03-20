@@ -4,9 +4,17 @@
 # OpenGrok Index Scheduler Main Script
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Load .env if it exists
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    # Use set -a to export all variables from .env automatically
+    set -a
+    source "$PROJECT_ROOT/.env"
+    set +a
+fi
+
 source "$PROJECT_ROOT/bin/monitor.sh"
 DB_QUERY="$PROJECT_ROOT/bin/db_query.sh"
-LOG_DIR="$PROJECT_ROOT/logs"
+LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
 mkdir -p "$LOG_DIR"
 
 # Function to check if current time is within range
@@ -96,7 +104,7 @@ if [[ "$1" != "--no-run" ]]; then
     # Handle --status argument
     if [[ "$1" == "--status" ]]; then
         echo "[OpenGrok Indexing Summary]"
-        echo "--------------------------------------------------------------------------------"
+        echo "----------------------------------------------------------------------------------------------------"
         printf "%-25s | %-12s | %-20s | %-12s | %-20s\n" "Service Name" "Status" "Start Time" "Duration" "Message"
         echo "----------------------------------------------------------------------------------------------------"
         
@@ -160,15 +168,15 @@ if [[ "$1" != "--no-run" ]]; then
     log "OpenGrok Scheduler Started."
     
     while true; do
-        # 1. Load Config
-        START_TIME=$($DB_QUERY "SELECT value FROM config WHERE key='start_time';")
-        END_TIME=$($DB_QUERY "SELECT value FROM config WHERE key='end_time';")
-        THRESHOLD=$($DB_QUERY "SELECT value FROM config WHERE key='resource_threshold';")
-        INTERVAL=$($DB_QUERY "SELECT value FROM config WHERE key='check_interval';")
+        # 1. Load Config (Use environment variables with defaults)
+        START=${START_TIME:-18:00}
+        END=${END_TIME:-06:00}
+        THRESHOLD=${RESOURCE_THRESHOLD:-70}
+        INTERVAL=${CHECK_INTERVAL:-300}
 
         # 2. Check Time Range
-        if ! check_time_range "$START_TIME" "$END_TIME" > /dev/null; then
-            log "Outside working hours ($START_TIME ~ $END_TIME). Sleeping..."
+        if ! check_time_range "$START" "$END" > /dev/null; then
+            log "Outside working hours ($START ~ $END). Sleeping..."
         else
             # 3. Check Resources
             CPU=$(get_cpu_usage)

@@ -3,7 +3,15 @@
 # bin/db_query.sh
 # SQLite3 query execution utility
 
-DB_PATH="/home/tonny/projects/opengrok-scheduler/data/scheduler.db"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Load .env if it exists
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    source "$PROJECT_ROOT/.env"
+fi
+
+# Use DB_PATH from .env or fallback to default
+DB_PATH="${DB_PATH:-$PROJECT_ROOT/data/scheduler.db}"
 
 # Ensure the database is initialized
 if [ ! -f "$DB_PATH" ]; then

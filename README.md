@@ -5,7 +5,7 @@ This is a Bash-based helper that organizes indexing for more than 70 OpenGrok se
 ## Main Features
 
 - **Time-Based Work**: It only works during the hours you set (like 18:00 to 06:00).
-- **Live Settings**: It reads the rules from the notebook (SQLite3) every time it checks, so you don't have to restart it to change rules.
+- **Easy Settings**: It reads the rules from a simple `.env` file, so it's easy to change rules for different servers.
 - **Body Check (Resource Monitoring)**: 
   - **Brain (CPU)**: It checks how hard the brain is working right now.
   - **Thinking Space (Memory)**: It looks at the real space left for thinking (available memory).
@@ -33,6 +33,8 @@ opengrok-scheduler/
 │   └── scheduler.db    # The notebook file itself
 ├── tests/              # Games and tests to check if everything works
 ├── logs/               # A diary of every action the helper takes
+├── .env.example        # A template for your own rules
+├── .env                # Your own rules (you make this from the template)
 ├── README.md           # This guide
 ├── ARCHITECTURE.md     # A big map of how it all works
 └── TASK.md             # A checklist of what we have done
@@ -49,6 +51,13 @@ opengrok-scheduler/
 ```bash
 mkdir -p data logs
 sqlite3 data/scheduler.db < sql/init_db.sql
+
+### 3. Set Your Rules
+Copy the template and edit it with your favorite text editor:
+```bash
+cp .env.example .env
+vi .env
+```
 ```
 
 ### 3. Add Your Boxes
@@ -85,21 +94,23 @@ Clear the diary for the last 23 hours:
 ```
 
 ### Changing the Rules
-You can change rules in the `config` table of the notebook.
+You can change rules in the `.env` file. The helper reads this file every time it looks for a new task, so you don't need to restart it after a change.
 
 | Rule Name | What It Is | Default |
 |:---|:---|:---|
-| `start_time` | When work begins | `18:00` |
-| `end_time` | When work ends | `06:00` |
-| `resource_threshold` | How busy the computer can be (%) | `70` |
-| `check_interval` | How long to wait between checks (seconds) | `300` |
-| `net_interface` | Which internet pipe to watch | - |
-| `max_bandwidth` | Max speed of the internet | - |
-| `disk_device` | Which disk to watch | - |
+| `DB_PATH` | Where the notebook file is | `data/scheduler.db` |
+| `LOG_DIR` | Where the diary is kept | `logs` |
+| `START_TIME` | When work begins | `18:00` |
+| `END_TIME` | When work ends | `06:00` |
+| `RESOURCE_THRESHOLD` | How busy the computer can be (%) | `70` |
+| `CHECK_INTERVAL` | How long to wait between checks (seconds) | `300` |
+| `NET_INTERFACE` | Which internet pipe to watch (Optional) | auto-detected |
+| `MAX_BANDWIDTH` | Max speed of the internet (Optional) | auto-detected |
+| `DISK_DEVICE` | Which disk to watch (Optional) | auto-detected |
 
 ```bash
-# Change the limit to 80%
-./bin/db_query.sh "UPDATE config SET value='80' WHERE key='resource_threshold';"
+# Example: Change the limit to 80%
+# Edit .env file and change RESOURCE_THRESHOLD=80
 ```
 
 ## Running Tests

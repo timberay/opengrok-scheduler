@@ -3,6 +3,13 @@
 # bin/monitor.sh
 # System Resource Monitoring Logic
 
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Load .env if it exists
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    source "$PROJECT_ROOT/.env"
+fi
+
 # CPU Usage calculated via 'top' (using 2nd iteration for current load)
 get_cpu_usage() {
     # -d 0.1: short delay between iterations
@@ -42,12 +49,8 @@ get_disk_usage() {
 # Disk I/O Utilization Percentage
 get_diskio_usage() {
     # 1. Identify the primary disk
-    # First, try to get from SQLite config (Key: 'disk_device')
-    local DB_PATH="data/scheduler.db"
-    local DISK=""
-    if [ -f "$DB_PATH" ]; then
-        DISK=$(sqlite3 "$DB_PATH" "SELECT value FROM config WHERE key='disk_device';" 2>/dev/null)
-    fi
+    # First, try to get from environment/config
+    local DISK="$DISK_DEVICE"
 
     # If not in SQLite, fallback to auto-detection from root (/)
     if [ -z "$DISK" ]; then
@@ -66,16 +69,8 @@ get_diskio_usage() {
 
 # Network Bandwidth Usage Percentage
 get_bandwidth_usage() {
-    local DB_PATH="data/scheduler.db"
-    local IFACE=""
-    local MAX_BW=0 
-    
-    # 1. Identify Network Interface
-    if [ -f "$DB_PATH" ]; then
-        IFACE=$(sqlite3 "$DB_PATH" "SELECT value FROM config WHERE key='net_interface';" 2>/dev/null)
-        M_BW=$(sqlite3 "$DB_PATH" "SELECT value FROM config WHERE key='max_bandwidth';" 2>/dev/null)
-        [ -n "$M_BW" ] && [[ "$M_BW" =~ ^[0-9]+$ ]] && MAX_BW=$M_BW
-    fi
+    local IFACE="$NET_INTERFACE"
+    local MAX_BW="${MAX_BANDWIDTH:-0}"
     
     if [ -z "$IFACE" ]; then
         IFACE=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+')

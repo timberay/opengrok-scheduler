@@ -12,7 +12,7 @@ This tool helps manage many OpenGrok boxes. It runs them one by one during the n
   - **Thinking Space (Memory)**: It makes sure there is enough room to think, excluding temporary notes (cache).
   - **Internet (Network)**: It checks how fast the internet pipe is moving.
   - **Busy Score (Process)**: it counts how many other programs are running or waiting.
-- **Fair Turns**: It runs many boxes in order based on their priority in the notebook.
+- **Easy Settings**: It uses a simple `.env` file for rules, so they are easy to change.
 - **Diary (Logging)**: It writes everything down in a notebook (SQLite3) and a log file.
 - **Status Report**: You can ask for a summary using the `--status` command.
 
@@ -24,11 +24,14 @@ This tool helps manage many OpenGrok boxes. It runs them one by one during the n
 
 ## 4. Notebook Design (SQLite3)
 
-### 4.1 Rules Table (`config`)
-This table holds the rules for the helper.
-- `id`: Row number
-- `key`: The name of the rule (like 'start_time' or 'resource_threshold')
-- `value`: What the rule is set to
+### 4.1 Configuration File (`.env`)
+This file holds the rules for the helper.
+- `DB_PATH`: Where the notebook file is
+- `LOG_DIR`: Where the diary is kept
+- `START_TIME`: When work begins
+- `END_TIME`: When work ends
+- `RESOURCE_THRESHOLD`: How busy the computer can be
+- `CHECK_INTERVAL`: How long to wait between checks
 
 ### 4.2 Boxes Table (`services`)
 This is the list of boxes to work on.
@@ -50,7 +53,7 @@ This is where the helper writes down what happened.
 ## 5. How Corporate Brain Works (The Algorithm)
 
 ### 5.1 The Main Loop
-1. Read the rules from the notebook.
+1. Read the rules from the `.env` file.
 2. Check the clock. Is it time to work? If not, wait and check again.
 3. Check the computer's body. If any measurement is too high (above the limit), wait.
 4. Look for the next box that needs help (not worked in the last 23 hours).
