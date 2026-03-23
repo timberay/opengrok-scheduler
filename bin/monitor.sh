@@ -274,22 +274,25 @@ get_process_state() {
 }
 
 # Evaluate process busyness based on /proc/stat and /proc/loadavg
-# Returns a "Busy Score" where 70+ indicates high load
+# Returns a "Busy Score" where RESOURCE_THRESHOLD+ indicates high load
 get_proc_usage() {
     local CORES=$(nproc)
     local RUNNING=$(grep procs_running /proc/stat | awk '{print $2}')
     local BLOCKED=$(grep procs_blocked /proc/stat | awk '{print $2}')
     local TOTAL=$(ls /proc | grep '^[0-9]' | wc -l)
 
+    # .env에 정의된 부하 기준율 (기본값 70) 
+    local REF_VAL=${RESOURCE_THRESHOLD:-70}
+
     # 1. Score by Running processes (Rule: running > cores * 2 is busy)
-    # We want 70 when running == cores * 2
-    local SCORE_R=$(( RUNNING * 70 / (CORES * 2) ))
+    # We want REF_VAL when running == cores * 2
+    local SCORE_R=$(( RUNNING * REF_VAL / (CORES * 2) ))
 
     # 2. Score by Blocked processes (Rule: blocked > 10 is busy)
-    # We want 70 when blocked == 10
-    local SCORE_B=$(( BLOCKED * 70 / 10 ))
+    # We want REF_VAL when blocked == 10
+    local SCORE_B=$(( BLOCKED * REF_VAL / 10 ))
 
-    # 3. Score by R-state ratio (Rule: ratio > 70% is busy)
+    # 3. Score by R-state ratio (Rule: ratio > RESOURCE_THRESHOLD% is busy)
     # R_Ratio = (Running / Total) * 100
     local SCORE_RATIO=0
     if [ "$TOTAL" -gt 0 ]; then

@@ -238,45 +238,45 @@ if [[ "$1" != "--no-run" ]]; then
         if ! check_time_range "$START" "$END" > /dev/null; then
             log "Outside working hours ($START ~ $END). Sleeping..."
         else
-            # 3. Check Resources
-            CPU=$(get_cpu_usage)
-            MEM=$(get_mem_usage)
-            DISK=$(get_disk_usage)
-            DISKIO=$(get_diskio_usage)
-            NET=$(get_bandwidth_usage)
-            PROC=$(get_proc_usage)
-            LOAD=$(get_cpu_load_average)
-            IOWAIT=$(get_iowait)
-            SWAP=$(get_swap_usage)
-            INODE=$(get_inode_usage)
+            # 3. Get Next Job (Exclude services already RUNNING or COMPLETED today)
+            QUERY="SELECT s.id FROM services s 
+                   LEFT JOIN (
+                       SELECT service_id, AVG(duration) as avg_duration 
+                       FROM jobs 
+                       WHERE status='COMPLETED' 
+                       GROUP BY service_id
+                   ) j_stats ON s.id = j_stats.service_id
+                   WHERE s.is_active=1 
+                   AND NOT EXISTS (
+                       SELECT 1 FROM jobs j 
+                       WHERE j.service_id = s.id 
+                       AND j.start_time > datetime('now', 'localtime', '-23 hours') 
+                       AND j.status IN ('RUNNING', 'COMPLETED')
+                   )
+                   ORDER BY COALESCE(j_stats.avg_duration, -1) DESC, s.container_name ASC 
+                   LIMIT 1;"
+            NEXT_SERVICE_ID=$($DB_QUERY "$QUERY")
             
-            if ! check_thresholds "$CPU" "$MEM" "$DISK" "$DISKIO" "$NET" "$PROC" "$LOAD" "$IOWAIT" "$SWAP" "$INODE" "$THRESHOLD"; then
-                log "Resource limit exceeded: $LAST_BYPASS_REASON. Waiting..."
+            if [ -z "$NEXT_SERVICE_ID" ]; then
+                log "All tasks completed for today. Waiting..."
             else
-                # 4. Get Next Job (Exclude services already RUNNING or COMPLETED today)
-                QUERY="SELECT s.id FROM services s 
-                       LEFT JOIN (
-                           SELECT service_id, AVG(duration) as avg_duration 
-                           FROM jobs 
-                           WHERE status='COMPLETED' 
-                           GROUP BY service_id
-                       ) j_stats ON s.id = j_stats.service_id
-                       WHERE s.is_active=1 
-                       AND NOT EXISTS (
-                           SELECT 1 FROM jobs j 
-                           WHERE j.service_id = s.id 
-                           AND j.start_time > datetime('now', 'localtime', '-23 hours') 
-                           AND j.status IN ('RUNNING', 'COMPLETED')
-                       )
-                       ORDER BY COALESCE(j_stats.avg_duration, -1) DESC, s.container_name ASC 
-                       LIMIT 1;"
-                NEXT_SERVICE_ID=$($DB_QUERY "$QUERY")
+                CONTAINER_NAME=$($DB_QUERY "SELECT container_name FROM services WHERE id=$NEXT_SERVICE_ID;")
+
+                # 4. Check Resources
+                CPU=$(get_cpu_usage)
+                MEM=$(get_mem_usage)
+                DISK=$(get_disk_usage)
+                DISKIO=$(get_diskio_usage)
+                NET=$(get_bandwidth_usage)
+                PROC=$(get_proc_usage)
+                LOAD=$(get_cpu_load_average)
+                IOWAIT=$(get_iowait)
+                SWAP=$(get_swap_usage)
+                INODE=$(get_inode_usage)
                 
-                if [ -z "$NEXT_SERVICE_ID" ]; then
-                    log "All tasks completed for today. Waiting..."
+                if ! check_thresholds "$CPU" "$MEM" "$DISK" "$DISKIO" "$NET" "$PROC" "$LOAD" "$IOWAIT" "$SWAP" "$INODE" "$THRESHOLD"; then
+                    log "Resource limit exceeded: $LAST_BYPASS_REASON. Container '$CONTAINER_NAME' is waiting..."
                 else
-                    CONTAINER_NAME=$($DB_QUERY "SELECT container_name FROM services WHERE id=$NEXT_SERVICE_ID;")
-                    
                     # 5. Double Check: Is there already a process running for this container?
                     if ps -elf | grep -v grep | grep "run_indexing_task" | grep -q "$CONTAINER_NAME"; then
                         log "Process check skip: $CONTAINER_NAME is already being indexed. Skipping..."
@@ -286,8 +286,8 @@ if [[ "$1" != "--no-run" ]]; then
                         BG_PIDS["$CONTAINER_NAME"]=$!
                         BG_PREV_STATE["$CONTAINER_NAME"]="RUNNING"
                         # Update DB with PID immediately
-                        $DB_QUERY "UPDATE jobs SET pid=${BG_PIDS[$CNAME]}, process_state='RUNNING' WHERE service_id=$NEXT_SERVICE_ID AND status='RUNNING' ORDER BY id DESC LIMIT 1;"
-                        log "Background PID=${BG_PIDS[$CONTAINER_NAME]} started for $CONTAINER_NAME"
+                        $DB_QUERY "UPDATE jobs SET pid=$!, process_state='RUNNING' WHERE service_id=$NEXT_SERVICE_ID AND status='RUNNING' ORDER BY id DESC LIMIT 1;"
+                        log "Background PID=$! started for $CONTAINER_NAME"
                     fi
                 fi
             fi
