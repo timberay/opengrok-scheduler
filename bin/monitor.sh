@@ -27,7 +27,12 @@ check_monitor_deps
 # CPU Usage calculated via 'vmstat' (using 2nd iteration for current load)
 get_cpu_usage() {
     # 2nd iteration of vmstat provides current interval average
-    local IDLE=$(timeout 5 vmstat 1 2 | tail -1 | awk '{print $15}')
+    # Dynamically find the "id" (Idle) column index from the header (Line 2)
+    local IDLE=$(timeout 5 vmstat 1 2 | awk '
+        NR==2 { for(i=1; i<=NF; i++) if($i=="id") {col=i; break} }
+        NR > 2 { val=$col }
+        END { print val }
+    ')
     if [ -z "$IDLE" ] || [[ ! $IDLE =~ ^[0-9]+$ ]]; then
         IDLE=0 # Default to 0 idle (100% busy) on error
     fi
@@ -37,8 +42,12 @@ get_cpu_usage() {
 # I/O Wait Percentage via 'vmstat'
 get_iowait() {
     # 2nd iteration of vmstat provides current interval average
-    # wa is the 16th column
-    local WAIT=$(timeout 5 vmstat 1 2 | tail -1 | awk '{print $16}')
+    # Dynamically find the "wa" (Wait) column index from the header (Line 2)
+    local WAIT=$(timeout 5 vmstat 1 2 | awk '
+        NR==2 { for(i=1; i<=NF; i++) if($i=="wa") {col=i; break} }
+        NR > 2 { val=$col }
+        END { print val }
+    ')
     if [ -z "$WAIT" ] || [[ ! $WAIT =~ ^[0-9]+$ ]]; then
         WAIT=100 # Default to high wait on error
     fi
