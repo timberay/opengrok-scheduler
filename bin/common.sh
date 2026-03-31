@@ -12,21 +12,27 @@ export PROJECT_ROOT
 # Preserves existing environment variables if they are already set
 load_env() {
     if [ -f "$PROJECT_ROOT/.env" ]; then
-        # Save current values to avoid unintended overrides if they are already in the env
-        local _saved_DB_PATH="$DB_PATH"
-        local _saved_LOG_DIR="$LOG_DIR"
-        local _saved_CHECK_INTERVAL="$CHECK_INTERVAL"
-        local _saved_RESOURCE_THRESHOLD="$RESOURCE_THRESHOLD"
-        
+        # Save ALL config variables that might be pre-set
+        local _SAVED_VARS=(
+            DB_PATH LOG_DIR LOG_RETENTION_DAYS
+            START_TIME END_TIME
+            RESOURCE_THRESHOLD CHECK_INTERVAL JOB_TIMEOUT_SEC JOB_IDLE_TIMEOUT
+            IOWAIT_THRESHOLD SWAP_THRESHOLD INODE_THRESHOLD
+            DISK_DEVICE NET_INTERFACE MAX_BANDWIDTH
+        )
+        declare -A _SAVED
+        for var in "${_SAVED_VARS[@]}"; do
+            [ -n "${!var}" ] && _SAVED[$var]="${!var}"
+        done
+
         set -a
         source "$PROJECT_ROOT/.env"
         set +a
-        
-        # Restore if they were already set before sourcing .env
-        [ -n "$_saved_DB_PATH" ] && DB_PATH="$_saved_DB_PATH"
-        [ -n "$_saved_LOG_DIR" ] && LOG_DIR="$_saved_LOG_DIR"
-        [ -n "$_saved_CHECK_INTERVAL" ] && CHECK_INTERVAL="$_saved_CHECK_INTERVAL"
-        [ -n "$_saved_RESOURCE_THRESHOLD" ] && RESOURCE_THRESHOLD="$_saved_RESOURCE_THRESHOLD"
+
+        # Restore pre-existing values
+        for var in "${!_SAVED[@]}"; do
+            export "$var"="${_SAVED[$var]}"
+        done
     fi
 }
 
