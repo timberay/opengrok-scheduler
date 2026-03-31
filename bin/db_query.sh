@@ -13,20 +13,26 @@ fi
 
 # Execute Query
 # Execute Query with Concurrency Optimizations
-# We run PRAGMAs and the query, but filter out PRAGMA results (wal, 10000, etc.)
-INIT_FILE=$(mktemp)
-echo "PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL;" > "$INIT_FILE"
-
-# Capture stderr to a temporary file to distinguish between data and errors
+# Use heredoc and skip PRAGMA output lines
+set -o pipefail
 STDERR_FILE=$(mktemp)
-sqlite3 -batch -init "$INIT_FILE" "$DB_PATH" "$1" 2>"$STDERR_FILE" | grep -vE "^(wal|[0-9]{5})$"
-QUERY_EXIT=$?
 
-# Output filtered errors to stderr
+# Execute commands: PRAGMAs set up the connection, then run the query
+# Skip first 2 lines (10000 from busy_timeout, wal from journal_mode)
+sqlite3 -batch "$DB_PATH" <<EOSQL 2>"$STDERR_FILE" | tail -n +3
+PRAGMA busy_timeout=10000;
+PRAGMA journal_mode=WAL;
+$1
+EOSQL
+
+# Capture sqlite3 exit code (first element of PIPESTATUS)
+QUERY_EXIT=${PIPESTATUS[0]}
+
+# Output errors to stderr (filter init noise)
 if [ -s "$STDERR_FILE" ]; then
-    # Filter out init noise and output real errors
-    grep -vE "^(-- Loading resources|wal)$" "$STDERR_FILE" >&2
+    grep -vE "^(-- Loading resources)$" "$STDERR_FILE" >&2
 fi
 
-rm -f "$INIT_FILE" "$STDERR_FILE"
+rm -f "$STDERR_FILE"
+set +o pipefail
 exit $QUERY_EXIT
