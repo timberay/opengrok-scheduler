@@ -12,18 +12,23 @@ if [ ! -f "$DB_PATH" ]; then
     exit 0
 fi
 
+# Helper function for safe concurrent DB access
+migrate_query() {
+    sqlite3 "$DB_PATH" "PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL; $1"
+}
+
 # Function to add column if it doesn't exist
 add_column_if_missing() {
     local TABLE=$1
     local COLUMN=$2
     local TYPE_AND_DEFAULT=$3
-    
-    # Check if column exists
-    local EXISTS=$(sqlite3 "$DB_PATH" "PRAGMA table_info($TABLE);" | grep "|$COLUMN|")
+
+    # Check if column exists (using safe query)
+    local EXISTS=$(migrate_query "PRAGMA table_info($TABLE);" | grep "|$COLUMN|")
     
     if [ -z "$EXISTS" ]; then
         echo "[Migration] Adding column '$COLUMN' to table '$TABLE'..."
-        sqlite3 "$DB_PATH" "ALTER TABLE $TABLE ADD COLUMN $COLUMN $TYPE_AND_DEFAULT;"
+        migrate_query "ALTER TABLE $TABLE ADD COLUMN $COLUMN $TYPE_AND_DEFAULT;"
         if [ $? -eq 0 ]; then
             echo "[Migration] Successfully added '$COLUMN' to '$TABLE'."
         else
@@ -45,11 +50,11 @@ add_column_if_missing "jobs" "process_state" "TEXT DEFAULT 'UNKNOWN'"
 
 # 3. Heartbeat Table Migration
 echo "[Migration] Ensuring heartbeat table exists..."
-sqlite3 "$DB_PATH" "CREATE TABLE IF NOT EXISTS heartbeat (id INTEGER PRIMARY KEY, last_pulse DATETIME);"
+migrate_query "CREATE TABLE IF NOT EXISTS heartbeat (id INTEGER PRIMARY KEY, last_pulse DATETIME);"
 
 # 4. Jobs Table Status Constraint Migration (Requires table recreation in SQLite)
 check_and_update_status_constraint() {
-    local SCHEMA=$(sqlite3 "$DB_PATH" ".schema jobs")
+    local SCHEMA=$(migrate_query ".schema jobs")
     if ! echo "$SCHEMA" | grep -q "ORPHANED" || ! echo "$SCHEMA" | grep -q "TIMEOUT"; then
         echo "[Migration] Updating status CHECK constraint in 'jobs' table..."
         
@@ -58,6 +63,9 @@ check_and_update_status_constraint() {
         local COLS="id, service_id, status, pid, process_state, start_time, end_time, duration, message"
 
         sqlite3 "$DB_PATH" <<EOF
+PRAGMA busy_timeout=10000;
+PRAGMA journal_mode=WAL;
+EOF
 PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
 
