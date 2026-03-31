@@ -52,11 +52,11 @@ log() {
 
 # Helper to format duration
 format_duration() {
-    local SECONDS=$1
-    if [ -z "$SECONDS" ]; then echo "-"; return; fi
-    local H=$((SECONDS / 3600))
-    local M=$(( (SECONDS % 3600) / 60 ))
-    local S=$((SECONDS % 60))
+    local SECS=$1
+    if [ -z "$SECS" ]; then echo "-"; return; fi
+    local H=$((SECS / 3600))
+    local M=$(( (SECS % 3600) / 60 ))
+    local S=$((SECS % 60))
     printf "%dh %dm %ds" "$H" "$M" "$S"
 }
 
