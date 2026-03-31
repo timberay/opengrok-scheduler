@@ -7,8 +7,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 source "$PROJECT_ROOT/bin/monitor.sh"
 DB_QUERY="$PROJECT_ROOT/bin/db_query.sh"
-JOB_IDLE_TIMEOUT="${JOB_IDLE_TIMEOUT:-300}"
-export JOB_IDLE_TIMEOUT
+JOB_TIMEOUT_SEC="${JOB_TIMEOUT_SEC:-7200}"
+export JOB_TIMEOUT_SEC
 
 # If LOG_DIR is relative, prepend PROJECT_ROOT
 if [[ "$LOG_DIR" != /* ]]; then
@@ -60,98 +60,20 @@ format_duration() {
     printf "%dh %dm %ds" "$H" "$M" "$S"
 }
 
-# Get total CPU time (user + system) for a process from /proc/<PID>/stat
-# Returns the sum in clock ticks; if process doesn't exist, returns "0"
-get_process_cputime() {
-    local PID=$1
-    if [ ! -f "/proc/$PID/stat" ]; then
-        echo "0"
-        return
-    fi
-    # Fields 14 (utime) + 15 (stime) in /proc/<PID>/stat
-    awk '{print $14 + $15}' "/proc/$PID/stat" 2>/dev/null || echo "0"
-}
-
-# Function to execute indexing task and update DB
+# Function to execute indexing task and return exit code
 run_indexing_task() {
-    local SERVICE_ID=$1
-    local CONTAINER_NAME=$2
-    
-    validate_integer "$SERVICE_ID" || return 1
-    validate_name "$CONTAINER_NAME" || return 1
-
-    # Insert and get ID in the same session with atomic transaction
-    local JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; INSERT INTO jobs (service_id, status, start_time) VALUES ($SERVICE_ID, 'RUNNING', datetime('now', 'localtime')); SELECT last_insert_rowid(); COMMIT;")
-    
-    if [ $? -ne 0 ] || [ -z "$JOB_ID" ]; then
-        log "[Error] Failed to create job record in database for $CONTAINER_NAME. Skipping..."
-        return 1
-    fi
-    
-    local START_SEC=$(date +%s)
-    # Use global/env value if set, otherwise default 300
-    local IDLE_LIMIT=${JOB_IDLE_TIMEOUT:-300}
+    local CONTAINER_NAME=$1
+    local MAX_DURATION=${JOB_TIMEOUT_SEC:-7200}
     
     # ----------------------------------------------------------------------
     # [MODIFY] Enter the actual indexing command in the section below.
     # e.g. docker exec "$CONTAINER_NAME" /usr/local/bin/indexer
     # ----------------------------------------------------------------------
     
-    # Actual command execution (Keep stdin isolated, run in subshell to monitor)
-    (
-        exec < /dev/null 2>&1
-        # docker exec "$CONTAINER_NAME" /usr/local/bin/indexer 
-        sleep 2
-    ) &
-    local CMD_PID=$!
-
-    # Monitor for idle timeout (CPU time not advancing = idle)
-    local PREV_CPUTIME=$(get_process_cputime "$CMD_PID")
-    local IDLE_ELAPSED=0
-
-    while kill -0 "$CMD_PID" 2>/dev/null; do
-        sleep 10
-        local CURR_CPUTIME=$(get_process_cputime "$CMD_PID")
-        if [ "$CURR_CPUTIME" = "$PREV_CPUTIME" ]; then
-            IDLE_ELAPSED=$((IDLE_ELAPSED + 10))
-            if [ "$IDLE_ELAPSED" -ge "$IDLE_LIMIT" ]; then
-                log "[Warning] Idle timeout: $CONTAINER_NAME (PID=$CMD_PID) no CPU activity for ${IDLE_ELAPSED}s. Killing..."
-                kill -TERM "$CMD_PID" 2>/dev/null
-                sleep 5
-                kill -9 "$CMD_PID" 2>/dev/null
-                break
-            fi
-        else
-            IDLE_ELAPSED=0  # Reset: process is actively working
-            PREV_CPUTIME="$CURR_CPUTIME"
-        fi
-    done
-
-    wait "$CMD_PID" 2>/dev/null
-    
-    # Capture the exit code
-    local EXIT_CODE=$? 
-    
-    # ----------------------------------------------------------------------
-    
-    local END_SEC=$(date +%s)
-    local DURATION=$((END_SEC - START_SEC))
-    
-    # Handle idle timeout khusus
-    if [ "$IDLE_ELAPSED" -ge "$IDLE_LIMIT" ]; then
-        $DB_QUERY "UPDATE jobs SET status='TIMEOUT', end_time=datetime('now', 'localtime'), duration=$DURATION, message='Idle ${IDLE_ELAPSED}s (limit: ${IDLE_LIMIT}s)' WHERE id=$JOB_ID;"
-        log "[Warning] Batch job $CONTAINER_NAME idle-timed out after ${IDLE_ELAPSED}s."
-        return 1
-    fi
-
-    if [ "$EXIT_CODE" -eq 0 ]; then
-        $DB_QUERY "UPDATE jobs SET status='COMPLETED', end_time=datetime('now', 'localtime'), duration=$DURATION WHERE id=$JOB_ID;"
-        log "Batch job $CONTAINER_NAME completed successfully."
-    else
-        $DB_QUERY "UPDATE jobs SET status='FAILED', end_time=datetime('now', 'localtime'), duration=$DURATION, message='Exit code $EXIT_CODE' WHERE id=$JOB_ID;"
-        log "Batch job $CONTAINER_NAME failed."
-    fi
-    return $EXIT_CODE
+    # Actual command execution (Keep stdin isolated, run with absolute timeout)
+    exec < /dev/null 2>&1
+    timeout "$MAX_DURATION" bash -c "sleep 2" # REPLACEME: docker exec "$CONTAINER_NAME" /usr/local/bin/indexer
+    return $?
 }
 
 # Main Execution Loop (Only run if not sourced with --no-run)
@@ -226,16 +148,35 @@ if [[ "$1" != "--no-run" ]]; then
         S_NAME=$(echo "$SERVICE_INFO" | cut -d'|' -f2)
         
         log "Manually starting batch job for $S_NAME..."
-        run_indexing_task "$S_ID" "$S_NAME"
-        exit $?
+        
+        local JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; INSERT INTO jobs (service_id, status, start_time) VALUES ($S_ID, 'RUNNING', datetime('now', 'localtime')); SELECT last_insert_rowid(); COMMIT;")
+        
+        if [ $? -ne 0 ] || [ -z "$JOB_ID" ]; then
+            log "[Error] Failed to create job record in database for $S_NAME. Skipping..."
+            exit 1
+        fi
+        
+        run_indexing_task "$S_NAME"
+        local REAP_EXIT=$?
+        
+        if [ "$REAP_EXIT" -eq 124 ]; then
+            $DB_QUERY "UPDATE jobs SET status='TIMEOUT', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Max duration limit exceeded' WHERE id=$JOB_ID;"
+            log "[Warning] Batch job $S_NAME timed out after ${JOB_TIMEOUT_SEC}s."
+        elif [ "$REAP_EXIT" -eq 0 ]; then
+            $DB_QUERY "UPDATE jobs SET status='COMPLETED', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER) WHERE id=$JOB_ID;"
+            log "Batch job $S_NAME completed successfully."
+        else
+            $DB_QUERY "UPDATE jobs SET status='FAILED', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Exit code $REAP_EXIT' WHERE id=$JOB_ID;"
+            log "Batch job $S_NAME failed with exit code $REAP_EXIT."
+        fi
+        
+        exit $REAP_EXIT
     fi
 
     log "Batch Job Scheduler Started."
     
-    # Automatic Log Cleanup (Keep last N days)
-    LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
-    find "$LOG_DIR" -name "*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null
-    log "Cleaned up logs older than ${LOG_RETENTION_DAYS} days."
+    # Automatic Log Cleanup moved to loop
+    LAST_LOG_CLEANUP=""
     
     # Run Database Migration (ensure schema is up-to-date)
     "$PROJECT_ROOT/bin/migrate_db.sh"
@@ -261,10 +202,12 @@ if [[ "$1" != "--no-run" ]]; then
                     wait "$PID" 2>/dev/null
                     local REAP_EXIT=$?
                     log "Process finished: $CNAME (PID=$PID, exit=$REAP_EXIT)"
-                    if [ "$REAP_EXIT" -eq 0 ]; then
-                        $DB_QUERY "UPDATE jobs SET status='COMPLETED', process_state='EXITED', end_time=datetime('now', 'localtime') WHERE pid=$PID AND status='RUNNING';"
+                    if [ "$REAP_EXIT" -eq 124 ]; then
+                        $DB_QUERY "UPDATE jobs SET status='TIMEOUT', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Max duration limit exceeded' WHERE pid=$PID AND status='RUNNING';"
+                    elif [ "$REAP_EXIT" -eq 0 ]; then
+                        $DB_QUERY "UPDATE jobs SET status='COMPLETED', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER) WHERE pid=$PID AND status='RUNNING';"
                     else
-                        $DB_QUERY "UPDATE jobs SET status='FAILED', process_state='EXITED', end_time=datetime('now', 'localtime'), message='Exit code $REAP_EXIT' WHERE pid=$PID AND status='RUNNING';"
+                        $DB_QUERY "UPDATE jobs SET status='FAILED', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Exit code $REAP_EXIT' WHERE pid=$PID AND status='RUNNING';"
                     fi
                     unset BG_PIDS["$CNAME"]
                     unset BG_PREV_STATE["$CNAME"]
@@ -289,24 +232,48 @@ if [[ "$1" != "--no-run" ]]; then
         done
     }
 
-    # Clean up stale RUNNING records from previous crash
+    # Attempt to recover previously RUNNING jobs by checking process existence
+    log "Attempting to recover previously RUNNING jobs..."
+    RECOVER_JOBS=$($DB_QUERY "SELECT j.id, j.pid, s.container_name FROM jobs j JOIN services s ON j.service_id=s.id WHERE j.status='RUNNING' AND j.pid IS NOT NULL;")
+    if [ -n "$RECOVER_JOBS" ]; then
+        while IFS='|' read -r JID JPID JCNAME; do
+            if kill -0 "$JPID" 2>/dev/null && grep -q "bash" "/proc/$JPID/comm" 2>/dev/null; then
+                log "[Recovery] Restored job tracking for $JCNAME (PID=$JPID)"
+                BG_PIDS["$JCNAME"]=$JPID
+                BG_PREV_STATE["$JCNAME"]="RUNNING"
+            else
+                log "[Warning] PID $JPID for $JCNAME is not alive or invalid. Marking ORPHANED."
+                $DB_QUERY "UPDATE jobs SET status='ORPHANED', process_state='UNKNOWN' WHERE id=$JID;"
+            fi
+        done <<< "$RECOVER_JOBS"
+    fi
+    
+    # Mark any remaining RUNNING ones without a valid PID as ORPHANED too
     $DB_QUERY "UPDATE jobs SET status='ORPHANED', process_state='UNKNOWN' WHERE status='RUNNING' AND (process_state IS NULL OR process_state NOT IN ('COMPLETED', 'FAILED'));"
-    log "Stale RUNNING jobs marked as ORPHANED (PID unverifiable after restart)."
     
     while true; do
+        # Log Cleanup (Keep last N days)
+        CUR_DATE=$(date +%Y%m%d)
+        if [ "$LAST_LOG_CLEANUP" != "$CUR_DATE" ]; then
+            LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
+            find "$LOG_DIR" -name "*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null
+            log "Cleaned up logs older than ${LOG_RETENTION_DAYS} days."
+            LAST_LOG_CLEANUP="$CUR_DATE"
+        fi
+
         # 0. Update Heartbeat (Signal liveness)
         $DB_QUERY "REPLACE INTO heartbeat (id, last_pulse) VALUES (1, datetime('now', 'localtime'));"
         
         reap_bg_processes
 
-        # 0. Auto-expire stale RUNNING jobs (no activity for 2x idle timeout)
-        STALE_LIMIT=$((${JOB_IDLE_TIMEOUT:-300} * 2))
+        # 0. Auto-expire stale RUNNING jobs (no activity for 2x timeout duration)
+        STALE_LIMIT=$((${JOB_TIMEOUT_SEC:-7200} * 2))
         STALE_JOBS=$($DB_QUERY "SELECT j.id, j.pid, s.container_name FROM jobs j JOIN services s ON j.service_id=s.id WHERE j.status IN ('RUNNING', 'ORPHANED') AND j.start_time < datetime('now', 'localtime', '-${STALE_LIMIT} seconds');")
         if [ -n "$STALE_JOBS" ]; then
             while IFS='|' read -r JID JPID JCNAME; do
                 log "[Warning] Expiring stale job id=$JID ($JCNAME, PID=$JPID)."
                 [ -n "$JPID" ] && kill -TERM "$JPID" 2>/dev/null
-                $DB_QUERY "UPDATE jobs SET status='TIMEOUT', end_time=datetime('now', 'localtime'), message='Stale auto-expired' WHERE id=$JID;"
+                $DB_QUERY "UPDATE jobs SET status='TIMEOUT', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Stale auto-expired' WHERE id=$JID;"
                 unset BG_PIDS["$JCNAME"] 2>/dev/null
                 unset BG_PREV_STATE["$JCNAME"] 2>/dev/null
             done <<< "$STALE_JOBS"
@@ -373,12 +340,19 @@ if [[ "$1" != "--no-run" ]]; then
                         log "Process check skip: $CONTAINER_NAME is already being indexed. Skipping..."
                     else
                         # 6. Execute Job (Simple Background)
-                        run_indexing_task "$NEXT_SERVICE_ID" "$CONTAINER_NAME" &
-                        BG_PIDS["$CONTAINER_NAME"]=$!
-                        BG_PREV_STATE["$CONTAINER_NAME"]="RUNNING"
-                        # Update DB with PID immediately
-                        $DB_QUERY "UPDATE jobs SET pid=$!, process_state='RUNNING' WHERE service_id=$NEXT_SERVICE_ID AND status='RUNNING' ORDER BY id DESC LIMIT 1;"
-                        log "Background PID=$! started for $CONTAINER_NAME"
+                        local JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; INSERT INTO jobs (service_id, status, start_time) VALUES ($NEXT_SERVICE_ID, 'RUNNING', datetime('now', 'localtime')); SELECT last_insert_rowid(); COMMIT;")
+                        
+                        if [ $? -ne 0 ] || [ -z "$JOB_ID" ]; then
+                            log "[Error] Failed to create job record in database for $CONTAINER_NAME. Skipping..."
+                        else
+                            run_indexing_task "$CONTAINER_NAME" &
+                            local PID=$!
+                            BG_PIDS["$CONTAINER_NAME"]=$PID
+                            BG_PREV_STATE["$CONTAINER_NAME"]="RUNNING"
+                            # Update DB with PID immediately
+                            $DB_QUERY "UPDATE jobs SET pid=$PID, process_state='RUNNING' WHERE id=$JOB_ID;"
+                            log "Background PID=$PID started for $CONTAINER_NAME (Job ID: $JOB_ID)"
+                        fi
                     fi
                 fi
             fi

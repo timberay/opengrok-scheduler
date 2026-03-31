@@ -11,7 +11,7 @@ This is a Bash-based helper that organizes batch jobs for more than 70 service b
   - **Thinking Space (Memory)**: It looks at the real space left for thinking (Available Memory and Swap Usage).
   - **Internet (Network)**: It detects the speed and checks how much is being used across all physical interfaces.
   - **Disk & Inodes**: It checks if the disks are busy or running out of indexing space (Disk Usage, Disk I/O, and Inode Usage) for all local partitions automatically.
-- **Dynamic Process Tracking**: It tracks the live status of each batch job (like Running, Sleeping, or Disk Wait) and automatically cleans up finished or stuck tasks (Zombie reaping).
+- **Dynamic Process Tracking**: It tracks the live status of each batch job, recovers lost processes after restarts, and safely times out jobs that exceed their absolute duration limit.
 - **Process Usage**: It counts how many other programs are running or waiting.
 - **Notebook Management (SQLite3)**: It keeps the list of boxes, rules, and history in a small notebook file.
 - **Background Work**: It can start batch jobs in the background so it can do more than one thing at a time.
@@ -114,6 +114,8 @@ You can change rules in the `.env` file. The helper reads this file every time i
 | `END_TIME` | When work ends | `06:00` |
 | `RESOURCE_THRESHOLD` | How busy the computer can be (%) | `70` |
 | `CHECK_INTERVAL` | How long to wait between checks (seconds) | `300` |
+| `JOB_TIMEOUT_SEC` | Max allowed execution time for a job (seconds) | `7200` |
+| `LOG_RETENTION_DAYS` | How many days to keep old log files | `30` |
 | `IOWAIT_THRESHOLD` | Max allowed I/O Wait (%) | `20` |
 | `SWAP_THRESHOLD` | Max allowed Swap usage (%) | `50` |
 | `INODE_THRESHOLD` | Max allowed Inode usage (%) | `90` |
@@ -138,7 +140,7 @@ Run these games to make sure the helper is working:
 ./tests/test_input_validation.sh  # Check if the helper rejects bad input (SQL injection etc.)
 ./tests/test_async_concurrency.sh # Check if many boxes can work at the same time
 ./tests/test_orphan_status.sh     # Check if the helper detects jobs after a crash
-./tests/test_idle_timeout.sh      # Check if hung processes are stopped after a timeout
+./tests/test_idle_timeout.sh      # Check if jobs exceeding max duration are stopped
 ./tests/test_init_option.sh       # Check if the "start fresh" command works
 ./tests/test_service_option.sh    # Check if running one box right away works
 ./tests/test_sequence_mode.sh    # Check if the helper can run boxes one by one
