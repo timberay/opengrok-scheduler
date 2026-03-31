@@ -22,3 +22,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     message TEXT,
     FOREIGN KEY (service_id) REFERENCES services(id)
 );
+
+-- Heartbeat Table
+CREATE TABLE IF NOT EXISTS heartbeat (
+    id INTEGER PRIMARY KEY,
+    last_pulse DATETIME
+);
