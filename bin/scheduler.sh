@@ -73,8 +73,7 @@ run_indexing_task() {
     # ----------------------------------------------------------------------
     
     # Actual command execution (Keep stdin isolated, run with absolute timeout)
-    exec < /dev/null 2>&1
-    timeout "$MAX_DURATION" bash -c "sleep 2" # REPLACEME: docker exec "$CONTAINER_NAME" /usr/local/bin/indexer
+    timeout "$MAX_DURATION" bash -c "sleep 2" < /dev/null 2>&1 # REPLACEME: docker exec "$CONTAINER_NAME" /usr/local/bin/indexer
     return $?
 }
 
