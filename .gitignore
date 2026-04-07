@@ -17,9 +17,9 @@ tmp/
 .agent/
 .claude/
 
-# markdown files
-/*.md
-!/README.md
+# markdown files (keep only README.md)
+*.md
+!README.md
 
 # Ignore IDE and AI tool local state.
 .superpowers/
