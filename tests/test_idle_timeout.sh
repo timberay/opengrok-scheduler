@@ -66,6 +66,31 @@ fi
 kill $CPU_PARENT 2>/dev/null
 wait $CPU_PARENT 2>/dev/null
 
+# --- Unit Test: kill_process_tree ---
+echo ""
+echo "[Case 0c] Unit test: kill_process_tree"
+
+# Source scheduler functions (need --no-run to avoid entering main loop)
+source "$BIN_DIR/scheduler.sh" --no-run 2>/dev/null
+
+# Spawn a deep process tree: parent -> child -> grandchild
+bash -c 'bash -c "sleep 120" & sleep 120' &
+TREE_PID=$!
+sleep 1
+
+BEFORE_DESC=$(get_descendant_pids $TREE_PID | wc -w)
+kill_process_tree "$TREE_PID"
+sleep 2
+
+# Verify all processes are gone
+if ! kill -0 $TREE_PID 2>/dev/null; then
+    pass "kill_process_tree terminated parent PID $TREE_PID and $BEFORE_DESC descendants"
+else
+    fail "kill_process_tree failed to kill parent PID $TREE_PID"
+    kill -9 $TREE_PID 2>/dev/null
+fi
+wait $TREE_PID 2>/dev/null
+
 # Summary (placeholder for later tasks)
 echo ""
 echo "=============================="

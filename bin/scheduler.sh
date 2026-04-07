@@ -76,6 +76,33 @@ run_indexing_task() {
     return $?
 }
 
+# Kill an entire process tree: SIGTERM first, SIGKILL after grace period
+# Args: PID
+kill_process_tree() {
+    local ROOT_PID=$1
+    local DESCENDANTS
+    DESCENDANTS=$(get_descendant_pids "$ROOT_PID")
+
+    # Kill leaf-to-root order: descendants first, then root
+    local ALL_PIDS_REVERSED=""
+    for PID in $DESCENDANTS; do
+        ALL_PIDS_REVERSED="$PID $ALL_PIDS_REVERSED"
+    done
+
+    # SIGTERM to all (descendants first, then root)
+    for PID in $ALL_PIDS_REVERSED $ROOT_PID; do
+        kill -TERM "$PID" 2>/dev/null
+    done
+
+    # Grace period
+    sleep 3
+
+    # SIGKILL any survivors
+    for PID in $ALL_PIDS_REVERSED $ROOT_PID; do
+        kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null
+    done
+}
+
 # Main Execution Loop (Only run if not sourced with --no-run)
 if [[ "$1" != "--no-run" ]]; then
 
