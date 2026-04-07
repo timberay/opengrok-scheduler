@@ -287,10 +287,15 @@ if [[ "$1" != "--no-run" ]]; then
                     unset BG_IDLE_SINCE["$CNAME"]
                     ;;
                 STOPPED)
-                    log "[Warning] Process stopped: $CNAME (PID=$PID). Sending SIGCONT then SIGTERM..."
+                    log "[Warning] Process stopped: $CNAME (PID=$PID). Terminating process tree..."
                     kill -CONT "$PID" 2>/dev/null
-                    sleep 2
-                    kill -TERM "$PID" 2>/dev/null
+                    kill_process_tree "$PID"
+                    wait "$PID" 2>/dev/null
+                    $DB_QUERY "UPDATE jobs SET status='FAILED', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Process was stopped (SIGSTOP), terminated' WHERE pid=$PID AND status='RUNNING';"
+                    unset BG_PIDS["$CNAME"]
+                    unset BG_PREV_STATE["$CNAME"]
+                    unset BG_LAST_CPU["$CNAME"]
+                    unset BG_IDLE_SINCE["$CNAME"]
                     ;;
                 DISK_WAIT)
                     log "[Warning] Process in uninterruptible I/O: $CNAME (PID=$PID). Will retry on next reap cycle."
