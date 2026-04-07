@@ -9,6 +9,8 @@ source "$PROJECT_ROOT/bin/monitor.sh"
 DB_QUERY="$PROJECT_ROOT/bin/db_query.sh"
 JOB_TIMEOUT_SEC="${JOB_TIMEOUT_SEC:-7200}"
 export JOB_TIMEOUT_SEC
+JOB_IDLE_TIMEOUT="${JOB_IDLE_TIMEOUT:-300}"
+export JOB_IDLE_TIMEOUT
 
 # If LOG_DIR is relative, prepend PROJECT_ROOT
 if [[ "$LOG_DIR" != /* ]]; then
@@ -211,6 +213,8 @@ if [[ "$1" != "--no-run" ]]; then
     # PID Tracking and State Management
     declare -A BG_PIDS       # KEY=CONTAINER_NAME, VALUE=PID
     declare -A BG_PREV_STATE  # KEY=CONTAINER_NAME, VALUE=last known state
+    declare -A BG_LAST_CPU    # KEY=CONTAINER_NAME, VALUE=last sampled CPU jiffies
+    declare -A BG_IDLE_SINCE  # KEY=CONTAINER_NAME, VALUE=epoch when idle started (0=active)
 
     reap_bg_processes() {
         for CNAME in "${!BG_PIDS[@]}"; do
@@ -238,6 +242,8 @@ if [[ "$1" != "--no-run" ]]; then
                     fi
                     unset BG_PIDS["$CNAME"]
                     unset BG_PREV_STATE["$CNAME"]
+                    unset BG_LAST_CPU["$CNAME"]
+                    unset BG_IDLE_SINCE["$CNAME"]
                     ;;
                 ZOMBIE)
                     wait "$PID" 2>/dev/null
@@ -261,6 +267,8 @@ if [[ "$1" != "--no-run" ]]; then
                     fi
                     unset BG_PIDS["$CNAME"]
                     unset BG_PREV_STATE["$CNAME"]
+                    unset BG_LAST_CPU["$CNAME"]
+                    unset BG_IDLE_SINCE["$CNAME"]
                     ;;
                 STOPPED)
                     log "[Warning] Process stopped: $CNAME (PID=$PID). Sending SIGCONT then SIGTERM..."
@@ -270,6 +278,41 @@ if [[ "$1" != "--no-run" ]]; then
                     ;;
                 DISK_WAIT)
                     log "[Warning] Process in uninterruptible I/O: $CNAME (PID=$PID). Will retry on next reap cycle."
+                    ;;
+                RUNNING|SLEEPING)
+                    # Idle detection: sample CPU time across process tree
+                    if [ "${JOB_IDLE_TIMEOUT:-0}" -gt 0 ]; then
+                        local CURRENT_CPU
+                        CURRENT_CPU=$(get_tree_cpu_time "$PID")
+                        local LAST_CPU=${BG_LAST_CPU[$CNAME]:-""}
+
+                        if [ -n "$LAST_CPU" ] && [ "$CURRENT_CPU" -eq "$LAST_CPU" ] && [ "$CURRENT_CPU" -gt 0 ]; then
+                            # CPU time unchanged — process tree may be idle
+                            if [ "${BG_IDLE_SINCE[$CNAME]:-0}" -eq 0 ]; then
+                                BG_IDLE_SINCE["$CNAME"]=$(date +%s)
+                                log "[Idle] $CNAME (PID=$PID): CPU time unchanged at $CURRENT_CPU jiffies. Monitoring..."
+                            else
+                                local NOW
+                                NOW=$(date +%s)
+                                local ELAPSED=$(( NOW - BG_IDLE_SINCE[$CNAME] ))
+                                if [ "$ELAPSED" -ge "$JOB_IDLE_TIMEOUT" ]; then
+                                    log "[Idle Timeout] $CNAME (PID=$PID): idle for ${ELAPSED}s (limit: ${JOB_IDLE_TIMEOUT}s). Terminating..."
+                                    kill_process_tree "$PID"
+                                    wait "$PID" 2>/dev/null
+                                    $DB_QUERY "UPDATE jobs SET status='TIMEOUT', process_state='EXITED', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Idle timeout after ${ELAPSED}s' WHERE pid=$PID AND status='RUNNING';"
+                                    unset BG_PIDS["$CNAME"]
+                                    unset BG_PREV_STATE["$CNAME"]
+                                    unset BG_LAST_CPU["$CNAME"]
+                                    unset BG_IDLE_SINCE["$CNAME"]
+                                fi
+                            fi
+                        else
+                            # CPU time changed or first sample — reset idle timer
+                            BG_IDLE_SINCE["$CNAME"]=0
+                        fi
+
+                        BG_LAST_CPU["$CNAME"]=$CURRENT_CPU
+                    fi
                     ;;
             esac
         done
@@ -338,6 +381,8 @@ if [[ "$1" != "--no-run" ]]; then
                 $DB_QUERY "UPDATE jobs SET status='TIMEOUT', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Stale auto-expired' WHERE id=$JID;"
                 unset BG_PIDS["$JCNAME"] 2>/dev/null
                 unset BG_PREV_STATE["$JCNAME"] 2>/dev/null
+                unset BG_LAST_CPU["$JCNAME"] 2>/dev/null
+                unset BG_IDLE_SINCE["$JCNAME"] 2>/dev/null
             done <<< "$STALE_JOBS"
         fi
 
@@ -414,6 +459,8 @@ if [[ "$1" != "--no-run" ]]; then
                             # Update DB with PID immediately
                             $DB_QUERY "UPDATE jobs SET pid=$PID, process_state='RUNNING' WHERE id=$JOB_ID;"
                             log "Background PID=$PID started for $CONTAINER_NAME (Job ID: $JOB_ID)"
+                            BG_LAST_CPU["$CONTAINER_NAME"]=""
+                            BG_IDLE_SINCE["$CONTAINER_NAME"]=0
                         fi
                     fi
                 fi
