@@ -54,7 +54,7 @@ migrate_query "CREATE TABLE IF NOT EXISTS heartbeat (id INTEGER PRIMARY KEY, las
 
 # 4. Jobs Table Status Constraint Migration (Requires table recreation in SQLite)
 check_and_update_status_constraint() {
-    local SCHEMA=$(sqlite3 "$DB_PATH" ".schema jobs")
+    local SCHEMA=$(migrate_query "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs';")
     if ! echo "$SCHEMA" | grep -q "ORPHANED" || ! echo "$SCHEMA" | grep -q "TIMEOUT"; then
         echo "[Migration] Updating status CHECK constraint in 'jobs' table..."
 
