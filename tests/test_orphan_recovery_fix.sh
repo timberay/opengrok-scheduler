@@ -38,7 +38,13 @@ export END_TIME="23:01"
 export CHECK_INTERVAL="1"
 
 echo "[Test] Running scheduler to trigger recovery..."
-timeout 3 bash "$PROJECT_ROOT/bin/scheduler.sh" > /dev/null 2>&1
+# Background the scheduler, wait for recovery to complete, then SIGKILL
+# (SIGKILL avoids triggering cleanup_and_exit which would mark RUNNING jobs as ORPHANED)
+bash "$PROJECT_ROOT/bin/scheduler.sh" > /dev/null 2>&1 &
+SCHED_PID=$!
+sleep 8
+kill -9 $SCHED_PID 2>/dev/null
+wait $SCHED_PID 2>/dev/null
 
 # 6. Check results
 STATUS_LIVE=$($DB_QUERY "SELECT status FROM jobs WHERE service_id=$SVC_LIVE ORDER BY id DESC LIMIT 1;")
