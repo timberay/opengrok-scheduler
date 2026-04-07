@@ -6,6 +6,18 @@
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$PROJECT_ROOT/bin/monitor.sh"
 
+BG_PIDS=()
+cleanup_bg() {
+    for pid in "${BG_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -CONT "$pid" 2>/dev/null
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+    done
+}
+trap cleanup_bg EXIT
+
 echo "[Test] Resource Monitoring Test Started..."
 
 # 1. CPU Calculation Check
@@ -204,6 +216,7 @@ fi
 # 20. Process State Check (Background Sleep)
 sleep 2 &
 BG_PID=$!
+BG_PIDS+=($BG_PID)
 STATE=$(get_process_state $BG_PID)
 echo "Background Sleep State ($BG_PID): $STATE"
 if [ "$STATE" == "SLEEPING" ] || [ "$STATE" == "RUNNING" ]; then
@@ -219,6 +232,7 @@ wait $BG_PID 2>/dev/null
 # 21. Process State Check (Stopped Process)
 sleep 5 &
 BG_PID=$!
+BG_PIDS+=($BG_PID)
 kill -STOP $BG_PID
 sleep 0.1 # Give it a moment to stop
 STATE=$(get_process_state $BG_PID)

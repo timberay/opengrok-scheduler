@@ -9,6 +9,9 @@ source "$PROJECT_ROOT/tests/test_helper.sh"
 pass() { echo "[Pass] $1"; ((PASS++)); }
 fail() { echo "[Fail] $1"; ((FAIL++)); }
 
+TMPFILE=$(mktemp)
+trap 'rm -f "$TMPFILE"' EXIT
+
 echo "=============================="
 echo "[Test] exec Redirect Fix"
 echo "=============================="
@@ -21,7 +24,6 @@ echo ""
 echo "[Case 1] stderr is preserved after run_indexing_task call"
 
 # Redirect stdout to a temp file so we can detect if exec 2>&1 leaks stderr into it
-TMPFILE=$(mktemp)
 exec 3>&1           # save original stdout to fd 3
 exec 1>"$TMPFILE"   # stdout now goes to file
 
@@ -40,8 +42,6 @@ if grep -q "STDERR_LEAK_MARKER" "$TMPFILE"; then
 else
     pass "stderr is still independent after run_indexing_task"
 fi
-
-rm -f "$TMPFILE"
 
 print_test_summary
 exit $?

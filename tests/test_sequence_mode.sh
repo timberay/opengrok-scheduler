@@ -64,5 +64,7 @@ else
 fi
 
 kill $SCHEDULER_PID 2>/dev/null
+wait $SCHEDULER_PID 2>/dev/null
 cleanup_test_db "$TEST_DB"
 print_test_summary
+exit $?

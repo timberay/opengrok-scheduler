@@ -18,5 +18,5 @@ tmp/
 .claude/
 
 # markdown files
-*.md
-!README.md
+/*.md
+!/README.md

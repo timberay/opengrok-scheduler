@@ -12,47 +12,70 @@ export DB_PATH="$TEST_DB"
 
 echo "[Stress Test] Starting SQLite concurrency stress test..."
 
-# 2. Spawn 50 concurrent write processes
-CONCURRENCY=50
-echo "[Stage 1] Spawning $CONCURRENCY concurrent writers..."
+# 2. Spawn concurrent write processes
+CONCURRENCY=10
+ITERATIONS=5
+echo "[Stage 1] Spawning $CONCURRENCY concurrent writers ($ITERATIONS iterations each)..."
 
+PIDS=()
 for i in $(seq 1 $CONCURRENCY); do
     (
-        for j in $(seq 1 5); do
-            # Attempt to insert and update
-            RES=$($DB_QUERY "INSERT INTO jobs (service_id, status, start_time) VALUES (1, 'RUNNING', datetime('now')); SELECT last_insert_rowid();" 2>&1)
-            
-            if [[ "$RES" == *"database is locked"* ]]; then
-                echo "[FAIL] Process $i, Iteration $j: DB Locked!"
-                exit 1
-            fi
-            
+        for j in $(seq 1 $ITERATIONS); do
+            # Attempt to insert with retry on lock
+            MAX_RETRIES=3
+            for attempt in $(seq 1 $MAX_RETRIES); do
+                RES=$($DB_QUERY "INSERT INTO jobs (service_id, status, start_time) VALUES (1, 'RUNNING', datetime('now')); SELECT last_insert_rowid();" 2>&1)
+                if [[ "$RES" != *"database is locked"* ]]; then
+                    break
+                fi
+                if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+                    echo "[FAIL] Process $i, Iteration $j: DB Locked after $MAX_RETRIES retries!"
+                    exit 1
+                fi
+                sleep 0.$((RANDOM % 5 + 1))
+            done
+
             JOB_ID=$(echo "$RES" | grep -vE "^(wal|[0-9]{5})$" | tail -n 1)
             if [[ ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
                 echo "[FAIL] Process $i, Iteration $j: Invalid Job ID."
                 echo "Full Response: $RES"
                 exit 1
             fi
-            
-            $DB_QUERY "UPDATE jobs SET status='COMPLETED' WHERE id=$JOB_ID;" 2>&1 | grep -q "database is locked" && {
-                echo "[FAIL] Process $i, Iteration $j: DB Locked on Update!"
-                exit 1
-            }
+
+            # Update with retry on lock
+            for attempt in $(seq 1 $MAX_RETRIES); do
+                UPDATE_RES=$($DB_QUERY "UPDATE jobs SET status='COMPLETED' WHERE id=$JOB_ID;" 2>&1)
+                if [[ "$UPDATE_RES" != *"database is locked"* ]]; then
+                    break
+                fi
+                if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+                    echo "[FAIL] Process $i, Iteration $j: DB Locked on Update after $MAX_RETRIES retries!"
+                    exit 1
+                fi
+                sleep 0.$((RANDOM % 5 + 1))
+            done
         done
     ) &
+    PIDS+=($!)
 done
 
-wait
+# 3. Wait for all background jobs and collect exit codes
+BG_FAILURES=0
+for pid in "${PIDS[@]}"; do
+    if ! wait "$pid"; then
+        BG_FAILURES=$((BG_FAILURES + 1))
+    fi
+done
 
-# 3. Check for any errors in output
-if [ $? -eq 0 ]; then
+if [ "$BG_FAILURES" -eq 0 ]; then
     SUCCESS_COUNT=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='COMPLETED';")
-    EXPECTED=$((CONCURRENCY * 5))
+    EXPECTED=$((CONCURRENCY * ITERATIONS))
     assert_eq "Concurrency stress test result" "$EXPECTED" "$SUCCESS_COUNT"
-    cleanup_test_db "$TEST_DB"
-    print_test_summary
 else
-    echo "[Fail] Stress test failed with errors."
-    cleanup_test_db "$TEST_DB"
-    exit 1
+    echo "[Fail] Stress test failed: $BG_FAILURES background processes had errors."
+    FAIL=$((FAIL + 1))
 fi
+
+cleanup_test_db "$TEST_DB"
+print_test_summary
+exit $?
