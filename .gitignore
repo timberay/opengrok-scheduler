@@ -20,3 +20,11 @@ tmp/
 # markdown files
 /*.md
 !/README.md
+
+# Ignore IDE and AI tool local state.
+.superpowers/
+.worktrees/
+.claude/
+.ruby-lsp/
+.vscode/
+.idea/
