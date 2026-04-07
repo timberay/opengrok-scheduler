@@ -292,7 +292,7 @@ if [[ "$1" != "--no-run" ]]; then
 
                         local LAST_CPU=${BG_LAST_CPU[$CNAME]:-""}
 
-                        if [ -n "$LAST_CPU" ] && [ "$CURRENT_CPU" -eq "$LAST_CPU" ] && [ "$CURRENT_CPU" -gt 0 ]; then
+                        if [ -n "$LAST_CPU" ] && [ "$CURRENT_CPU" -eq "$LAST_CPU" ]; then
                             # CPU time unchanged — process tree may be idle
                             if [ "${BG_IDLE_SINCE[$CNAME]:-0}" -eq 0 ]; then
                                 BG_IDLE_SINCE["$CNAME"]=$(date +%s)

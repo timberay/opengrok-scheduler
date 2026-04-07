@@ -201,6 +201,44 @@ fi
 kill $SCHEDULER_PID 2>/dev/null
 wait $SCHEDULER_PID 2>/dev/null
 
+# --- Integration Test: Pure sleep (0 CPU) triggers idle timeout ---
+echo ""
+echo "[Case 3] Testing pure sleep process (0 CPU time) triggers idle timeout..."
+sqlite3 "$TEST_DB" "DELETE FROM jobs;"
+sqlite3 "$TEST_DB" "DELETE FROM services;"
+sqlite3 "$TEST_DB" "INSERT INTO services (container_name, priority, is_active) VALUES ('zerocpu_svc', 1, 1);"
+
+# Create a scheduler variant that runs pure sleep (no CPU work at all)
+TEMP_SCHEDULER_ZEROCPU=$(mktemp "$BIN_DIR/scheduler_test_zerocpu_XXXXXX.sh")
+sed 's|timeout "\$MAX_DURATION" bash -c "sleep 2"|timeout "$MAX_DURATION" bash -c "sleep 120"|' \
+    "$BIN_DIR/scheduler.sh" > "$TEMP_SCHEDULER_ZEROCPU"
+chmod +x "$TEMP_SCHEDULER_ZEROCPU"
+
+export JOB_IDLE_TIMEOUT=15
+export JOB_TIMEOUT_SEC=120
+export CHECK_INTERVAL=5
+export START_TIME=00:00
+export END_TIME=23:59
+export RESOURCE_THRESHOLD=200
+
+timeout 60s bash "$TEMP_SCHEDULER_ZEROCPU" &
+SCHEDULER_PID=$!
+
+sleep 45
+
+STATUS=$(sqlite3 "$TEST_DB" "SELECT status FROM jobs WHERE service_id=(SELECT id FROM services WHERE container_name='zerocpu_svc') ORDER BY id DESC LIMIT 1;")
+MSG=$(sqlite3 "$TEST_DB" "SELECT message FROM jobs WHERE service_id=(SELECT id FROM services WHERE container_name='zerocpu_svc') ORDER BY id DESC LIMIT 1;")
+
+if [ "$STATUS" == "TIMEOUT" ] && [[ "$MSG" == *"Idle"* ]]; then
+    pass "Zero-CPU process correctly timed out. Status=$STATUS, Msg=$MSG"
+else
+    fail "Zero-CPU process status: $STATUS, Msg: $MSG (expected TIMEOUT with 'Idle' in message)"
+fi
+
+kill $SCHEDULER_PID 2>/dev/null
+wait $SCHEDULER_PID 2>/dev/null
+rm -f "$TEMP_SCHEDULER_ZEROCPU"
+
 # Cleanup
 rm -f "$TEST_DB"
 rm -f "$TEMP_SCHEDULER"
