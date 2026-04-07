@@ -2,10 +2,13 @@
 # tests/test_db_error_handling.sh
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$PROJECT_ROOT/tests/test_helper.sh"
+
 DB_QUERY="$PROJECT_ROOT/bin/db_query.sh"
 
-PASS=0
-FAIL=0
+# Setup isolated test DB
+TEST_DB=$(setup_test_db)
+export DB_PATH="$TEST_DB"
 
 assert_error() {
     local query="$1"
@@ -14,7 +17,7 @@ assert_error() {
     # Capture stderr
     err_msg=$($DB_QUERY "$query" 2>&1 >/dev/null)
     local exit_code=$?
-    
+
     if [ "$exit_code" -ne 0 ]; then
         echo "[Pass] $desc (Exit: $exit_code)"
         PASS=$((PASS + 1))
@@ -33,13 +36,10 @@ assert_error "SELECT * FROM non_existent_table;" "Querying non-existent table fa
 assert_error "SELEC * FROM services;" "Invalid SQL syntax fails"
 
 # 3. Constraint violation
-# First ensure we have a service
-$DB_QUERY "INSERT OR IGNORE INTO services (container_name) VALUES ('test-duplicate');"
+$DB_QUERY "INSERT INTO services (container_name) VALUES ('test-duplicate');"
 assert_error "INSERT INTO services (container_name) VALUES ('test-duplicate');" "Duplicate UNIQUE constraint violation fails"
 
-echo "------------------------------------------"
-echo "Results: $PASS passed, $FAIL failed"
-echo "------------------------------------------"
+cleanup_test_db "$TEST_DB"
 
-[ "$FAIL" -gt 0 ] && exit 1
-exit 0
+print_test_summary
+exit $?
