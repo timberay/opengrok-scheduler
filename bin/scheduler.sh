@@ -263,7 +263,7 @@ if [[ "$1" != "--no-run" ]]; then
                     ;;
                 ZOMBIE)
                     wait "$PID" 2>/dev/null
-                    REAP_EXIT=$?
+                    local REAP_EXIT=$?
                     log "[Warning] Zombie reaped: $CNAME (PID=$PID, exit=$REAP_EXIT)"
                     if [ "$REAP_EXIT" -eq 124 ]; then
                         $DB_QUERY "UPDATE jobs SET status='TIMEOUT', process_state='EXITED',
