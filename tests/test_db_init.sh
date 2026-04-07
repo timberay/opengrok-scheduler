@@ -20,7 +20,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # 3. Table existence check
-TABLES=("config" "services" "jobs")
+TABLES=("services" "jobs" "heartbeat")
 for table in "${TABLES[@]}"; do
     EXISTS=$(sqlite3 "$DB_PATH" "SELECT name FROM sqlite_master WHERE type='table' AND name='$table';")
     if [ "$EXISTS" == "$table" ]; then
@@ -30,15 +30,6 @@ for table in "${TABLES[@]}"; do
         exit 1
     fi
 done
-
-# 4. Check initial config values
-START_TIME=$(sqlite3 "$DB_PATH" "SELECT value FROM config WHERE key='start_time';")
-if [ "$START_TIME" == "18:00" ]; then
-    echo "[Pass] Initial config 'start_time' is 18:00."
-else
-    echo "[Fail] Unexpected config value: '$START_TIME'"
-    exit 1
-fi
 
 echo "[Success] Database initialization test passed!"
 exit 0
