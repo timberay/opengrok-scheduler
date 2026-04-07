@@ -4,7 +4,13 @@
 # Test db_query.sh exit code propagation and grep filter fixes
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$PROJECT_ROOT/tests/test_helper.sh"
+
 DB_QUERY="$PROJECT_ROOT/bin/db_query.sh"
+
+# Setup isolated test DB
+TEST_DB=$(setup_test_db)
+export DB_PATH="$TEST_DB"
 
 echo "[Test] DB Query Fixes Test Started..."
 
@@ -17,6 +23,7 @@ if [ $INVALID_EXIT -ne 0 ]; then
     echo "[Pass] Invalid SQL returned non-zero exit code ($INVALID_EXIT)"
 else
     echo "[Fail] Invalid SQL returned exit code 0 (should be non-zero)"
+    cleanup_test_db "$TEST_DB"
     exit 1
 fi
 
@@ -29,13 +36,13 @@ if [ $VALID_EXIT -eq 0 ]; then
     echo "[Pass] Valid SQL returned exit code 0"
 else
     echo "[Fail] Valid SQL returned non-zero exit code ($VALID_EXIT)"
+    cleanup_test_db "$TEST_DB"
     exit 1
 fi
 
 # Test 3: 5-digit results should not be filtered
 echo "[Test 3] Testing that 5-digit query results are not filtered..."
 
-# Test actual 5-digit numbers (not leading-zero strings)
 TEST_CASES=("10000" "12345" "99999" "54321")
 FAILURES=0
 
@@ -60,6 +67,7 @@ fi
 
 if [ $FAILURES -gt 0 ]; then
     echo "[Test 3] Failed: $FAILURES values had issues"
+    cleanup_test_db "$TEST_DB"
     exit 1
 fi
 
@@ -70,8 +78,11 @@ if [ "$RESULT" == "wal" ]; then
     echo "[Pass] String 'wal' was not filtered"
 else
     echo "[Fail] String 'wal' was filtered (got: '$RESULT')"
+    cleanup_test_db "$TEST_DB"
     exit 1
 fi
+
+cleanup_test_db "$TEST_DB"
 
 echo "[Success] DB Query fixes test passed!"
 exit 0
