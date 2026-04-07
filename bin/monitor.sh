@@ -122,7 +122,13 @@ get_diskio_usage() {
         
         # Fallback to old logic if still empty
         if [ -z "$DISK" ]; then
-            DISK=$(df / | tail -1 | awk '{print $1}' | sed 's/.*\/dev\///; s/[0-9]*$//')
+            DISK=$(df / | tail -1 | awk '{print $1}' | sed 's|.*/dev/||')
+            # Strip partition suffix: "sda1" → "sda", "nvme0n1p1" → "nvme0n1"
+            if [[ "$DISK" =~ ^nvme ]]; then
+                DISK=$(echo "$DISK" | sed 's/p[0-9]*$//')
+            else
+                DISK=$(echo "$DISK" | sed 's/[0-9]*$//')
+            fi
         fi
     fi
 
@@ -134,7 +140,7 @@ get_diskio_usage() {
     ' | cut -d. -f1)
     
     if [ -z "$UTIL" ] || [[ ! $UTIL =~ ^[0-9]+$ ]]; then
-        UTIL=100 # Assume busy on error
+        UTIL=0 # Cannot measure — assume not busy (warn via check_monitor_deps)
     fi
     
     echo "$UTIL"
