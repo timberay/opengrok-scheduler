@@ -432,12 +432,12 @@ if [[ "$1" != "--no-run" ]]; then
                        WHERE status='COMPLETED' 
                        GROUP BY service_id
                    ) j_stats ON s.id = j_stats.service_id
-                   WHERE s.is_active=1 
+                   WHERE s.is_active=1
                    AND NOT EXISTS (
-                       SELECT 1 FROM jobs j 
-                       WHERE j.service_id = s.id 
-                       AND j.start_time > datetime('now', 'localtime', '-23 hours') 
-                       AND j.status IN ('RUNNING', 'COMPLETED', 'ORPHANED')
+                       SELECT 1 FROM jobs j
+                       WHERE j.service_id = s.id
+                       AND j.start_time > datetime('now', 'localtime', '-23 hours')
+                       AND j.status IN ('RUNNING', 'COMPLETED', 'ORPHANED', 'FAILED', 'TIMEOUT')
                    )
                    ORDER BY s.priority DESC, COALESCE(j_stats.avg_duration, -1) DESC, s.container_name ASC 
                    LIMIT 1;"
