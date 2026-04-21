@@ -102,5 +102,43 @@ fi
 
 cleanup_test_db "$TEST_DB"
 
+# ----------------------------------------------------------------------
+# Scenario 3: FAILED job older than 23 hours does NOT block re-selection.
+# ----------------------------------------------------------------------
+echo ""
+echo "[Scenario 3] FAILED job older than 23h should not block re-selection"
+
+TEST_DB=$(setup_test_db)
+export DB_PATH="$TEST_DB"
+
+$DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('svc_old_fail', 1, 1);"
+
+SVC_OLD_ID=$($DB_QUERY "SELECT id FROM services WHERE container_name='svc_old_fail';")
+
+# Pre-seed FAILED job older than 23 hours — should be OUTSIDE the exclusion window
+$DB_QUERY "INSERT INTO jobs (service_id, status, start_time, end_time, duration, message)
+           VALUES ($SVC_OLD_ID, 'FAILED',
+                   datetime('now', 'localtime', '-24 hours'),
+                   datetime('now', 'localtime', '-24 hours'),
+                   1, 'Pre-seeded old FAILED for test');"
+
+timeout 15s "$SCHEDULER" --sequence &
+SCHEDULER_PID=$!
+sleep 10
+kill "$SCHEDULER_PID" 2>/dev/null
+wait "$SCHEDULER_PID" 2>/dev/null
+
+NEW_JOBS=$($DB_QUERY "SELECT count(*) FROM jobs WHERE service_id=$SVC_OLD_ID AND status IN ('RUNNING', 'COMPLETED');")
+
+if [ "$NEW_JOBS" -ge 1 ]; then
+    echo "[Pass] svc_old_fail was re-selected and executed ($NEW_JOBS new RUNNING/COMPLETED job(s))"
+    PASS=$((PASS + 1))
+else
+    echo "[Fail] svc_old_fail should have been re-selected but got $NEW_JOBS new RUNNING/COMPLETED jobs"
+    FAIL=$((FAIL + 1))
+fi
+
+cleanup_test_db "$TEST_DB"
+
 print_test_summary
 exit $?
