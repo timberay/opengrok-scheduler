@@ -17,6 +17,7 @@ This is a Bash-based helper that organizes batch jobs for more than 70 service b
 - **Notebook Management (SQLite3)**: It keeps the list of boxes, rules, and history in a small notebook file.
 - **Background Work**: It can start batch jobs in the background so it can do more than one thing at a time.
 - **Sequential Execution (--sequence)**: If you prefer to run only one task at a time, use the `--sequence` flag to wait for the current job to finish before starting the next one.
+- **Concurrency Cap (MAX_CONCURRENT_JOBS)**: It limits the number of jobs that can run at the same time (default 4). This stops the server from being overloaded when several jobs finish the light "download" stage together and suddenly all start the heavy "indexing" stage. Applies to both the scheduled loop and `--service` manual triggers, and is race-safe across both paths.
 - **Fixed Checking Time**: It follows a strict schedule (like every 5 minutes) to scan for new tasks.
 - **Safe Notebook**: It uses special tricks (WAL and Busy Timeout) so many programs can talk to the notebook at the same time without problems.
 - **Automatic Schema Updates**: It automatically fixes the notebook layout (adds missing columns) every time it starts, so you don't have to worry about manual updates.
@@ -116,6 +117,7 @@ You can change rules in the `.env` file. The helper reads this file every time i
 | `END_TIME` | When work ends | `06:00` |
 | `RESOURCE_THRESHOLD` | How busy the computer can be (%) | `70` |
 | `CHECK_INTERVAL` | How long to wait between checks (seconds) | `300` |
+| `MAX_CONCURRENT_JOBS` | Max number of jobs running at the same time (hard cap; restart required after change) | `4` |
 | `JOB_TIMEOUT_SEC` | Max allowed execution time for a job (seconds) | `7200` |
 | `JOB_IDLE_TIMEOUT` | How long a job can be idle before timeout (seconds, 0=disabled) | `3600` |
 | `LOG_RETENTION_DAYS` | How many days to keep old log files | `30` |
@@ -141,6 +143,7 @@ Run these games to make sure the helper is working:
 ./tests/test_scheduler_logic.sh     # Check the time and waiting rules
 ./tests/test_async_concurrency.sh   # Check if many boxes can work at the same time
 ./tests/test_sequence_mode.sh       # Check if the helper can run boxes one by one
+./tests/test_concurrency_cap.sh     # Check that MAX_CONCURRENT_JOBS caps running jobs in both loop and --service paths
 ./tests/test_idle_timeout.sh        # Check if idle jobs (no CPU activity) are detected and stopped
 ./tests/test_sigterm_cleanup.sh     # Check if the helper cleans up on shutdown signal
 
