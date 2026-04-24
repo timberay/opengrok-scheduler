@@ -177,10 +177,29 @@ if [[ "$1" != "--no-run" ]]; then
         
         log "Manually starting batch job for $S_NAME..."
 
-        JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; INSERT INTO jobs (service_id, status, start_time) VALUES ($S_ID, 'RUNNING', datetime('now', 'localtime')); SELECT last_insert_rowid(); COMMIT;")
+        # Concurrency cap applies to manual trigger too — prevents bypassing the ceiling
+        # that protects against indexing-phase thundering herd.
+        MANUAL_MAX_CONCURRENT=${MAX_CONCURRENT_JOBS:-4}
+        if ! [[ "$MANUAL_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
+            MANUAL_MAX_CONCURRENT=4
+        fi
+
+        # Atomic INSERT-if-under-cap: race-safe against main-loop scheduler
+        JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
+INSERT INTO jobs (service_id, status, start_time) \
+SELECT $S_ID, 'RUNNING', datetime('now', 'localtime') \
+WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MANUAL_MAX_CONCURRENT; \
+SELECT CASE WHEN changes() > 0 THEN last_insert_rowid() ELSE 0 END; \
+COMMIT;")
 
         if [ $? -ne 0 ] || [ -z "$JOB_ID" ]; then
             log "[Error] Failed to create job record in database for $S_NAME. Skipping..."
+            exit 1
+        fi
+
+        if [ "$JOB_ID" = "0" ]; then
+            CURRENT=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE status='RUNNING';")
+            log "[Error] Concurrency cap reached: $CURRENT/$MANUAL_MAX_CONCURRENT jobs already running. Cannot start '$S_NAME'."
             exit 1
         fi
 
@@ -419,6 +438,11 @@ if [[ "$1" != "--no-run" ]]; then
         END=${END_TIME:-06:00}
         THRESHOLD=${RESOURCE_THRESHOLD:-70}
         INTERVAL=${CHECK_INTERVAL:-300}
+        MAX_CONCURRENT=${MAX_CONCURRENT_JOBS:-4}
+        if ! [[ "$MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
+            log "[Warning] MAX_CONCURRENT_JOBS='$MAX_CONCURRENT' invalid (must be positive integer). Falling back to 4."
+            MAX_CONCURRENT=4
+        fi
 
         # 2. Check Time Range
         if ! check_time_range "$START" "$END" > /dev/null; then
@@ -468,17 +492,28 @@ if [[ "$1" != "--no-run" ]]; then
                 if ! check_thresholds "$CPU" "$MEM" "$DISK" "$DISKIO" "$NET" "$PROC" "$LOAD" "$IOWAIT" "$SWAP" "$INODE" "$THRESHOLD"; then
                     log "Resource limit exceeded: $LAST_BYPASS_REASON. Container '$CONTAINER_NAME' is waiting..."
                 else
-                    # 5. Double Check: Is there already a process running for this container?
-                    if [[ "$MODE_SEQUENCE" == "true" ]] && [[ ${#BG_PIDS[@]} -gt 0 ]]; then
+                    # 5. Concurrency cap: fast-path count check (race-protected by atomic INSERT below)
+                    CURRENT_RUNNING=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE status='RUNNING';")
+                    if [ "${CURRENT_RUNNING:-0}" -ge "$MAX_CONCURRENT" ]; then
+                        log "Concurrency cap reached: $CURRENT_RUNNING/$MAX_CONCURRENT jobs running. '$CONTAINER_NAME' is waiting..."
+                    # 6. Double Check: Is there already a process running for this container?
+                    elif [[ "$MODE_SEQUENCE" == "true" ]] && [[ ${#BG_PIDS[@]} -gt 0 ]]; then
                         log "Process check skip: Sequence mode is enabled and ${#BG_PIDS[@]} job(s) already running."
                     elif [[ -n "${BG_PIDS[$CONTAINER_NAME]}" ]] && kill -0 "${BG_PIDS[$CONTAINER_NAME]}" 2>/dev/null; then
                         log "Process check skip: $CONTAINER_NAME is already being indexed. Skipping..."
                     else
-                        # 6. Execute Job (Simple Background)
-                        JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; INSERT INTO jobs (service_id, status, start_time) VALUES ($NEXT_SERVICE_ID, 'RUNNING', datetime('now', 'localtime')); SELECT last_insert_rowid(); COMMIT;")
+                        # 7. Execute Job — atomic INSERT-if-under-cap guards race with manual trigger (bin/scheduler.sh:180)
+                        JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
+INSERT INTO jobs (service_id, status, start_time) \
+SELECT $NEXT_SERVICE_ID, 'RUNNING', datetime('now', 'localtime') \
+WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MAX_CONCURRENT; \
+SELECT CASE WHEN changes() > 0 THEN last_insert_rowid() ELSE 0 END; \
+COMMIT;")
 
                         if [ $? -ne 0 ] || [ -z "$JOB_ID" ]; then
                             log "[Error] Failed to create job record in database for $CONTAINER_NAME. Skipping..."
+                        elif [ "$JOB_ID" = "0" ]; then
+                            log "Concurrency cap race: slot filled by concurrent path. '$CONTAINER_NAME' is waiting..."
                         else
                             run_indexing_task "$CONTAINER_NAME" &
                             PID=$!
