@@ -82,8 +82,17 @@ run_indexing_task() {
 
 # Kill an entire process tree: SIGTERM first, SIGKILL after grace period
 # Args: PID
+# Refuses invalid/reserved PIDs:
+#   - empty / non-numeric: malformed input from DB or upstream caller
+#   - 0: 'kill 0' broadcasts to the current process group (scheduler suicide)
+#   - 1: init/systemd; pgrep -P 1 enumerates every direct child of init,
+#        so blindly killing them would tear down unrelated system services.
 kill_process_tree() {
     local ROOT_PID=$1
+    if ! [[ "$ROOT_PID" =~ ^[0-9]+$ ]] || [ "$ROOT_PID" -le 1 ]; then
+        echo "[Error] kill_process_tree: refusing invalid/reserved PID '$ROOT_PID'" >&2
+        return 1
+    fi
     local DESCENDANTS
     DESCENDANTS=$(get_descendant_pids "$ROOT_PID")
 
