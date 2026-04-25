@@ -58,9 +58,12 @@ else
     fail "get_tree_cpu_time returned '$CPU_TIME' (expected > 0)"
 fi
 
-# Cleanup
-kill $CPU_PARENT 2>/dev/null
-wait $CPU_PARENT 2>/dev/null
+# Cleanup. The bash subshell spawned dd as a child; killing only $CPU_PARENT
+# leaves dd reparented to init, where it consumes a full CPU forever. Reap
+# descendants explicitly before reaping the parent.
+pkill -KILL -P "$CPU_PARENT" 2>/dev/null
+kill -KILL "$CPU_PARENT" 2>/dev/null
+wait "$CPU_PARENT" 2>/dev/null
 
 # --- Unit Test: kill_process_tree ---
 echo ""
