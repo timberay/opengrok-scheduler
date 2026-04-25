@@ -127,7 +127,7 @@ TEMP_SCHEDULER=$(mktemp "$BIN_DIR/scheduler_test_XXXXXX.sh")
 # Replace sleep 2 with a command that briefly uses CPU (dd) then sleeps long enough for idle detection.
 # The dd ensures CURRENT_CPU > 0 on first sample, then sleep 120 leaves CPU unchanged on subsequent
 # samples, satisfying the idle detection condition: CURRENT_CPU == LAST_CPU && CURRENT_CPU > 0.
-sed 's|timeout "\$MAX_DURATION" bash -c "sleep 2"|timeout "$MAX_DURATION" bash -c '"'"'x=1; while [ $x -le 10000 ]; do x=$((x+1)); done; sleep 120'"'"'|' \
+sed 's|timeout --kill-after=10s "\$MAX_DURATION" bash -c "sleep 2"|timeout --kill-after=10s "$MAX_DURATION" bash -c '"'"'x=1; while [ $x -le 10000 ]; do x=$((x+1)); done; sleep 120'"'"'|' \
     "$BIN_DIR/scheduler.sh" > "$TEMP_SCHEDULER"
 chmod +x "$TEMP_SCHEDULER"
 
@@ -201,7 +201,7 @@ sqlite3 "$TEST_DB" "INSERT INTO services (container_name, priority, is_active) V
 
 # Create a scheduler variant that runs pure sleep (no CPU work at all)
 TEMP_SCHEDULER_ZEROCPU=$(mktemp "$BIN_DIR/scheduler_test_zerocpu_XXXXXX.sh")
-sed 's|timeout "\$MAX_DURATION" bash -c "sleep 2"|timeout "$MAX_DURATION" bash -c "sleep 120"|' \
+sed 's|timeout --kill-after=10s "\$MAX_DURATION" bash -c "sleep 2"|timeout --kill-after=10s "$MAX_DURATION" bash -c "sleep 120"|' \
     "$BIN_DIR/scheduler.sh" > "$TEMP_SCHEDULER_ZEROCPU"
 chmod +x "$TEMP_SCHEDULER_ZEROCPU"
 

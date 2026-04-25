@@ -5,6 +5,54 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
+# Ensure iostat (from sysstat package) is available; install if missing.
+# Returns 0 if iostat is present at exit, non-zero on install failure.
+ensure_iostat() {
+    if command -v iostat &> /dev/null; then
+        return 0
+    fi
+
+    echo "[Info] iostat not found. Attempting to install 'sysstat' package..." >&2
+
+    local PKG_CMD=""
+    if command -v apt-get &> /dev/null; then
+        PKG_CMD="apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y sysstat"
+    elif command -v dnf &> /dev/null; then
+        PKG_CMD="dnf install -y sysstat"
+    elif command -v yum &> /dev/null; then
+        PKG_CMD="yum install -y sysstat"
+    elif command -v pacman &> /dev/null; then
+        PKG_CMD="pacman -S --noconfirm sysstat"
+    elif command -v zypper &> /dev/null; then
+        PKG_CMD="zypper --non-interactive install sysstat"
+    elif command -v apk &> /dev/null; then
+        PKG_CMD="apk add --no-cache sysstat"
+    else
+        echo "[Error] No supported package manager detected. Install 'sysstat' (provides iostat) manually." >&2
+        return 1
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        eval "$PKG_CMD" >&2
+    elif command -v sudo &> /dev/null; then
+        sudo -n true 2>/dev/null || {
+            echo "[Error] Passwordless sudo unavailable. Run: sudo bash -c \"$PKG_CMD\"" >&2
+            return 1
+        }
+        sudo -n bash -c "$PKG_CMD" >&2
+    else
+        echo "[Error] Need root or sudo to install sysstat. Run manually: $PKG_CMD" >&2
+        return 1
+    fi
+
+    if command -v iostat &> /dev/null; then
+        echo "[Info] iostat installed successfully." >&2
+        return 0
+    fi
+    echo "[Error] iostat install failed. Install 'sysstat' manually." >&2
+    return 1
+}
+
 # Check for required monitoring tools
 check_monitor_deps() {
     local MISSING=()
@@ -13,7 +61,7 @@ check_monitor_deps() {
             MISSING+=("$cmd")
         fi
     done
-    
+
     if [ ${#MISSING[@]} -gt 0 ]; then
         echo "[Warning] Monitoring tools missing: ${MISSING[*]}" >&2
         return 1
@@ -21,7 +69,8 @@ check_monitor_deps() {
     return 0
 }
 
-# Run dependency check on source
+# Run dependency check on source (auto-install iostat first)
+ensure_iostat
 check_monitor_deps
 
 # CPU Usage calculated via 'vmstat' (using 2nd iteration for current load)

@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 source "$PROJECT_ROOT/bin/monitor.sh"
 DB_QUERY="$PROJECT_ROOT/bin/db_query.sh"
-JOB_TIMEOUT_SEC="${JOB_TIMEOUT_SEC:-7200}"
+JOB_TIMEOUT_SEC="${JOB_TIMEOUT_SEC:-36000}"
 export JOB_TIMEOUT_SEC
 JOB_IDLE_TIMEOUT="${JOB_IDLE_TIMEOUT:-300}"
 export JOB_IDLE_TIMEOUT
@@ -65,7 +65,7 @@ format_duration() {
 # Function to execute indexing task and return exit code
 run_indexing_task() {
     local CONTAINER_NAME=$1
-    local MAX_DURATION=${JOB_TIMEOUT_SEC:-7200}
+    local MAX_DURATION=${JOB_TIMEOUT_SEC:-36000}
     
     # ----------------------------------------------------------------------
     # [MODIFY] Enter the actual indexing command in the section below.
@@ -73,7 +73,10 @@ run_indexing_task() {
     # ----------------------------------------------------------------------
     
     # Actual command execution (Keep stdin isolated, run with absolute timeout)
-    timeout "$MAX_DURATION" bash -c "sleep 2" < /dev/null 2>&1 # REPLACEME: docker exec "$CONTAINER_NAME" /usr/local/bin/indexer
+    # --kill-after=10s: SIGTERM the whole process group at MAX_DURATION; if any group
+    # member is still alive 10s later, escalate to SIGKILL. Prevents grandchild leaks
+    # when the wrapped command spawns subprocesses that ignore SIGTERM.
+    timeout --kill-after=10s "$MAX_DURATION" bash -c "sleep 2" < /dev/null 2>&1 # REPLACEME: docker exec "$CONTAINER_NAME" /usr/local/bin/indexer
     return $?
 }
 
@@ -179,9 +182,9 @@ if [[ "$1" != "--no-run" ]]; then
 
         # Concurrency cap applies to manual trigger too — prevents bypassing the ceiling
         # that protects against indexing-phase thundering herd.
-        MANUAL_MAX_CONCURRENT=${MAX_CONCURRENT_JOBS:-4}
+        MANUAL_MAX_CONCURRENT=${MAX_CONCURRENT_JOBS:-3}
         if ! [[ "$MANUAL_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
-            MANUAL_MAX_CONCURRENT=4
+            MANUAL_MAX_CONCURRENT=3
         fi
 
         # Atomic INSERT-if-under-cap: race-safe against main-loop scheduler
@@ -419,7 +422,7 @@ COMMIT;")
         reap_bg_processes
 
         # 0. Auto-expire stale RUNNING jobs (no activity for 2x timeout duration)
-        STALE_LIMIT=$((${JOB_TIMEOUT_SEC:-7200} * 2))
+        STALE_LIMIT=$((${JOB_TIMEOUT_SEC:-36000} * 2))
         STALE_JOBS=$($DB_QUERY "SELECT j.id, j.pid, s.container_name FROM jobs j JOIN services s ON j.service_id=s.id WHERE j.status IN ('RUNNING', 'ORPHANED') AND j.start_time < datetime('now', 'localtime', '-${STALE_LIMIT} seconds');")
         if [ -n "$STALE_JOBS" ]; then
             while IFS='|' read -r JID JPID JCNAME; do
@@ -438,10 +441,10 @@ COMMIT;")
         END=${END_TIME:-06:00}
         THRESHOLD=${RESOURCE_THRESHOLD:-70}
         INTERVAL=${CHECK_INTERVAL:-300}
-        MAX_CONCURRENT=${MAX_CONCURRENT_JOBS:-4}
+        MAX_CONCURRENT=${MAX_CONCURRENT_JOBS:-3}
         if ! [[ "$MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
-            log "[Warning] MAX_CONCURRENT_JOBS='$MAX_CONCURRENT' invalid (must be positive integer). Falling back to 4."
-            MAX_CONCURRENT=4
+            log "[Warning] MAX_CONCURRENT_JOBS='$MAX_CONCURRENT' invalid (must be positive integer). Falling back to 3."
+            MAX_CONCURRENT=3
         fi
 
         # 2. Check Time Range
