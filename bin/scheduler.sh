@@ -399,26 +399,23 @@ COMMIT;")
         done
     }
 
-    # Attempt to recover previously RUNNING jobs by checking process existence
+    # Attempt to recover previously RUNNING jobs by checking process identity.
+    # We compare the recorded (PID, starttime) tuple against /proc — comm
+    # alone was insufficient because common names like 'bash'/'sleep' produce
+    # false matches against unrelated user processes that happen to inherit
+    # a recycled PID, and a successful match would lead us to SIGKILL them.
     log "Attempting to recover previously RUNNING jobs..."
-    RECOVER_JOBS=$($DB_QUERY "SELECT j.id, j.pid, s.container_name FROM jobs j JOIN services s ON j.service_id=s.id WHERE j.status='RUNNING' AND j.pid IS NOT NULL;")
+    RECOVER_JOBS=$($DB_QUERY "SELECT j.id, j.pid, j.pid_starttime, s.container_name FROM jobs j JOIN services s ON j.service_id=s.id WHERE j.status='RUNNING' AND j.pid IS NOT NULL;")
     RECOVERED_PIDS=()
     if [ -n "$RECOVER_JOBS" ]; then
-        while IFS='|' read -r JID JPID JCNAME; do
-            # Check if process is alive - accept bash or any child process
-            if kill -0 "$JPID" 2>/dev/null && [ -d "/proc/$JPID" ]; then
-                PROC_COMM=$(cat "/proc/$JPID/comm" 2>/dev/null || echo "")
-                if [[ "$PROC_COMM" =~ ^(bash|sh|sleep|timeout)$ ]]; then
-                    log "[Recovery] Restored job tracking for $JCNAME (PID=$JPID, comm=$PROC_COMM)"
-                    BG_PIDS["$JCNAME"]=$JPID
-                    BG_PREV_STATE["$JCNAME"]="RUNNING"
-                    RECOVERED_PIDS+=("$JPID")
-                else
-                    log "[Warning] PID $JPID for $JCNAME has unexpected comm: $PROC_COMM. Marking ORPHANED."
-                    $DB_QUERY "UPDATE jobs SET status='ORPHANED', process_state='UNKNOWN' WHERE id=$JID;"
-                fi
+        while IFS='|' read -r JID JPID JSTART JCNAME; do
+            if [ -n "$JSTART" ] && verify_pid_identity "$JPID" "$JSTART"; then
+                log "[Recovery] Restored job tracking for $JCNAME (PID=$JPID, starttime=$JSTART)"
+                BG_PIDS["$JCNAME"]=$JPID
+                BG_PREV_STATE["$JCNAME"]="RUNNING"
+                RECOVERED_PIDS+=("$JPID")
             else
-                log "[Warning] PID $JPID for $JCNAME is not alive or invalid. Marking ORPHANED."
+                log "[Warning] PID $JPID for $JCNAME failed identity check (missing or mismatched starttime). Marking ORPHANED without kill."
                 $DB_QUERY "UPDATE jobs SET status='ORPHANED', process_state='UNKNOWN' WHERE id=$JID;"
             fi
         done <<< "$RECOVER_JOBS"
@@ -454,11 +451,19 @@ COMMIT;")
 
         # 0. Auto-expire stale RUNNING jobs (no activity for 2x timeout duration)
         STALE_LIMIT=$((${JOB_TIMEOUT_SEC:-36000} * 2))
-        STALE_JOBS=$($DB_QUERY "SELECT j.id, j.pid, s.container_name FROM jobs j JOIN services s ON j.service_id=s.id WHERE j.status IN ('RUNNING', 'ORPHANED') AND j.start_time < datetime('now', 'localtime', '-${STALE_LIMIT} seconds');")
+        STALE_JOBS=$($DB_QUERY "SELECT j.id, j.pid, j.pid_starttime, s.container_name FROM jobs j JOIN services s ON j.service_id=s.id WHERE j.status IN ('RUNNING', 'ORPHANED') AND j.start_time < datetime('now', 'localtime', '-${STALE_LIMIT} seconds');")
         if [ -n "$STALE_JOBS" ]; then
-            while IFS='|' read -r JID JPID JCNAME; do
+            while IFS='|' read -r JID JPID JSTART JCNAME; do
                 log "[Warning] Expiring stale job id=$JID ($JCNAME, PID=$JPID)."
-                [ -n "$JPID" ] && kill_process_tree "$JPID"
+                # Only kill if PID identity still matches. After 2x JOB_TIMEOUT_SEC
+                # (default 20h) the original PID has almost certainly been recycled
+                # to a different process; killing it blindly would tear down an
+                # unrelated process tree.
+                if [ -n "$JPID" ] && [ -n "$JSTART" ] && verify_pid_identity "$JPID" "$JSTART"; then
+                    kill_process_tree "$JPID"
+                elif [ -n "$JPID" ]; then
+                    log "[Warning] Skipping kill for $JCNAME: PID=$JPID identity check failed (missing starttime or PID recycled)."
+                fi
                 $DB_QUERY "UPDATE jobs SET status='TIMEOUT', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Stale auto-expired' WHERE id=$JID;"
                 unset BG_PIDS["$JCNAME"] 2>/dev/null
                 unset BG_PREV_STATE["$JCNAME"] 2>/dev/null
@@ -561,10 +566,16 @@ COMMIT;")
                             # because SIGKILL cannot be trapped.
                             ( trap '' SIGTERM SIGINT; run_indexing_task "$CONTAINER_NAME" ) &
                             PID=$!
+                            # Capture starttime alongside PID. PID alone is ambiguous
+                            # because the kernel recycles PID numbers, so identity
+                            # checks during recovery / stale-expire compare against
+                            # the (PID, starttime) tuple to avoid SIGKILLing an
+                            # unrelated process that happens to occupy the same PID.
+                            PID_STARTTIME=$(get_pid_starttime "$PID")
                             BG_PIDS["$CONTAINER_NAME"]=$PID
                             BG_PREV_STATE["$CONTAINER_NAME"]="RUNNING"
-                            # Update DB with PID immediately
-                            $DB_QUERY "UPDATE jobs SET pid=$PID, process_state='RUNNING' WHERE id=$JOB_ID;"
+                            # Update DB with PID + starttime for crash-safe recovery
+                            $DB_QUERY "UPDATE jobs SET pid=$PID, pid_starttime=${PID_STARTTIME:-NULL}, process_state='RUNNING' WHERE id=$JOB_ID;"
                             log "Background PID=$PID started for $CONTAINER_NAME (Job ID: $JOB_ID)"
                             BG_LAST_CPU["$CONTAINER_NAME"]=""
                             BG_IDLE_SINCE["$CONTAINER_NAME"]=0

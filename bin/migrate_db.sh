@@ -46,6 +46,7 @@ add_column_if_missing "services" "is_active" "INTEGER DEFAULT 1"
 
 # 2. Jobs Table Migrations
 add_column_if_missing "jobs" "pid" "INTEGER"
+add_column_if_missing "jobs" "pid_starttime" "INTEGER"
 add_column_if_missing "jobs" "process_state" "TEXT DEFAULT 'UNKNOWN'"
 
 # 3. Heartbeat Table Migration
@@ -71,6 +72,7 @@ CREATE TABLE jobs (
     service_id INTEGER NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('WAITING', 'RUNNING', 'COMPLETED', 'FAILED', 'TIMEOUT', 'ORPHANED')),
     pid INTEGER,
+    pid_starttime INTEGER,
     process_state TEXT DEFAULT 'UNKNOWN',
     start_time DATETIME,
     end_time DATETIME,
@@ -79,8 +81,8 @@ CREATE TABLE jobs (
     FOREIGN KEY (service_id) REFERENCES services(id)
 );
 
-INSERT INTO jobs (id, service_id, status, pid, process_state, start_time, end_time, duration, message)
-    SELECT id, service_id, status, pid, process_state, start_time, end_time, duration, message FROM jobs_old;
+INSERT INTO jobs (id, service_id, status, pid, pid_starttime, process_state, start_time, end_time, duration, message)
+    SELECT id, service_id, status, pid, pid_starttime, process_state, start_time, end_time, duration, message FROM jobs_old;
 
 DROP TABLE jobs_old;
 

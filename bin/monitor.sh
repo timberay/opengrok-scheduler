@@ -343,6 +343,53 @@ get_descendant_pids() {
     done
 }
 
+# Get start time (clock ticks since system boot) for a PID from /proc/<PID>/stat.
+# Field 22 of /proc/<PID>/stat is `starttime`. Used as a stable identity token
+# for a process: PID alone is ambiguous because the kernel recycles PID numbers,
+# but (PID, starttime) is effectively unique within a single boot.
+# Args: PID
+# Returns: starttime as integer string, or empty string if PID does not exist
+#          or input is malformed.
+get_pid_starttime() {
+    local PID=$1
+    if ! [[ "$PID" =~ ^[0-9]+$ ]] || [ ! -f "/proc/$PID/stat" ]; then
+        echo ""
+        return
+    fi
+    local STAT
+    STAT=$(cat "/proc/$PID/stat" 2>/dev/null) || { echo ""; return; }
+    # Field 2 (comm) can contain spaces and parens. Strip everything up to and
+    # including the last ')'; remaining starts at field 3, so starttime
+    # (field 22) is at offset 22-3+1 = 20 in AFTER_COMM.
+    local AFTER_COMM="${STAT##*) }"
+    local STARTTIME
+    read -r _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ STARTTIME _ <<< "$AFTER_COMM"
+    if [[ "$STARTTIME" =~ ^[0-9]+$ ]]; then
+        echo "$STARTTIME"
+    else
+        echo ""
+    fi
+}
+
+# Verify that PID currently corresponds to the same process whose start time
+# was previously recorded. Defends against PID reuse: if the OS has recycled
+# the PID to an unrelated process, its starttime will differ.
+# Args: PID, EXPECTED_STARTTIME
+# Returns: 0 if identity verified; 1 if dead, mismatched, or invalid input.
+verify_pid_identity() {
+    local PID=$1
+    local EXPECTED=$2
+    if ! [[ "$PID" =~ ^[0-9]+$ ]] || ! [[ "$EXPECTED" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if [ ! -d "/proc/$PID" ]; then
+        return 1
+    fi
+    local CURRENT
+    CURRENT=$(get_pid_starttime "$PID")
+    [ "$CURRENT" = "$EXPECTED" ]
+}
+
 # Get total CPU time (user + system jiffies) for a process and all its descendants
 # Args: PID
 # Returns: total jiffies (integer), or 0 if process doesn't exist
