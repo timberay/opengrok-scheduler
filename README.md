@@ -139,6 +139,7 @@ Run these games to make sure the helper is working:
 ```bash
 # Resource Monitoring
 ./tests/test_monitor.sh             # Check all 10 resource metrics and thresholds
+./tests/test_threshold_boundary.sh  # Check check_thresholds -gt boundary semantics (at LIMIT = safe, LIMIT+1 = breach)
 
 # Scheduler Logic
 ./tests/test_scheduler_logic.sh     # Check the time and waiting rules
