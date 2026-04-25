@@ -90,9 +90,13 @@ fi
 
 # --- Assert 3: recovery must NOT add the mismatched PID to BG_PIDS. We test
 #     this indirectly by running scheduler again with the same DB row reverted
-#     to RUNNING + wrong starttime, then checking the row gets marked ORPHANED. ---
+#     to RUNNING + wrong starttime, then checking the row gets marked ORPHANED.
+#     Bump JOB_TIMEOUT_SEC for this scheduler invocation so stale auto-expire
+#     (which would otherwise overwrite ORPHANED → TIMEOUT within ~2s) does not
+#     fire during our observation window. We are testing the recovery path
+#     in isolation here; the stale path is covered by Assert 1/2 above. ---
 sqlite3 "$TEST_DB" "UPDATE jobs SET status='RUNNING', start_time=datetime('now','localtime') WHERE id=$JOB_ID;"
-"$PROJECT_ROOT/bin/scheduler.sh" >/dev/null 2>&1 &
+JOB_TIMEOUT_SEC=300 "$PROJECT_ROOT/bin/scheduler.sh" >/dev/null 2>&1 &
 SCHEDULER_PID=$!
 sleep 3
 kill -TERM "$SCHEDULER_PID" 2>/dev/null
@@ -118,9 +122,10 @@ else
 fi
 
 # --- Assert 5: legitimate matching starttime DOES allow recovery. We verify
-#     by checking the row is restored as tracked (not marked ORPHANED). ---
-sqlite3 "$TEST_DB" "UPDATE jobs SET status='RUNNING', pid_starttime=$SENTINEL_START_REAL WHERE id=$JOB_ID;"
-"$PROJECT_ROOT/bin/scheduler.sh" >/dev/null 2>&1 &
+#     by checking the row is restored as tracked (not marked ORPHANED).
+#     Same JOB_TIMEOUT_SEC bump as Assert 3 to keep stale path out of scope. ---
+sqlite3 "$TEST_DB" "UPDATE jobs SET status='RUNNING', start_time=datetime('now','localtime'), pid_starttime=$SENTINEL_START_REAL WHERE id=$JOB_ID;"
+JOB_TIMEOUT_SEC=300 "$PROJECT_ROOT/bin/scheduler.sh" >/dev/null 2>&1 &
 SCHEDULER_PID=$!
 sleep 3
 

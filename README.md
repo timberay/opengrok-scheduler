@@ -121,6 +121,7 @@ You can change rules in the `.env` file. The helper reads this file every time i
 | `JOB_TIMEOUT_SEC` | Max allowed execution time for a job (seconds) | `36000` |
 | `JOB_IDLE_TIMEOUT` | How long a job can be idle before timeout (seconds, 0=disabled) | `3600` |
 | `LOG_RETENTION_DAYS` | How many days to keep old log files | `30` |
+| `KILL_GRACE_SEC` | Seconds between SIGTERM and SIGKILL when killing a job tree (allows graceful cleanup) | `10` |
 | `IOWAIT_THRESHOLD` | Max allowed I/O Wait (%) | `20` |
 | `SWAP_THRESHOLD` | Max allowed Swap usage (%) | `50` |
 | `INODE_THRESHOLD` | Max allowed Inode usage (%) | `90` |
@@ -162,9 +163,38 @@ Run these games to make sure the helper is working:
 # Process & Recovery
 ./tests/test_orphan_status.sh       # Check if the helper detects jobs after a crash
 ./tests/test_orphan_recovery_fix.sh # Check if orphaned jobs are recovered correctly
+./tests/test_kill_validation.sh     # Check kill_process_tree refuses PID 0/1/empty/non-numeric (no system damage)
+./tests/test_instance_lock.sh       # Check that two scheduler instances cannot run on the same DB
+./tests/test_signal_isolation.sh    # Check spawned jobs ignore broadcast SIGTERM so cleanup_and_exit can walk BG_PIDS
+./tests/test_pid_identity.sh        # Check (PID, starttime) identity helpers used to defend against PID reuse
+./tests/test_pid_reuse_defense.sh   # Check recovery and stale-expire skip kills when starttime mismatches
+./tests/test_kill_grace.sh          # Check kill_process_tree starttime re-verification and KILL_GRACE_SEC env var
 
 # Code Quality
 ./tests/test_input_validation.sh    # Check if the helper rejects bad input (SQL injection etc.)
 ./tests/test_local_keyword_fix.sh   # Check variable scoping (local keyword usage)
 ./tests/test_exec_redirect.sh       # Check stderr is not permanently redirected
 ```
+
+## Upgrading
+
+When upgrading from a pre-(PID, starttime) version, any jobs left in the
+RUNNING state by the old scheduler will lack a recorded `pid_starttime`
+and **cannot be safely identity-verified** by the new code. On the next
+startup the scheduler logs a `[Migration] Found N legacy RUNNING job(s)`
+warning and marks those rows as ORPHANED without issuing any kill — the
+PID alone could refer to a recycled, unrelated process.
+
+Recommended drain procedure before upgrading:
+
+1. Stop accepting new work outside the `START_TIME`–`END_TIME` window or
+   set `MAX_CONCURRENT_JOBS=0` and wait for in-flight jobs to finish.
+2. Verify with `bin/scheduler.sh --status` that no RUNNING rows remain.
+3. Deploy the new code and start the scheduler.
+
+If you cannot drain (e.g. an unattended crash left RUNNING rows behind),
+the `[Migration]` warning will tell you how many rows were affected. If
+the underlying processes are still running, terminate them manually
+(`pkill -f <indexer>`); otherwise wait — `KILL_GRACE_SEC` and the stale
+auto-expire path (2 × `JOB_TIMEOUT_SEC`) will eventually mark them
+TIMEOUT without attempting a kill.

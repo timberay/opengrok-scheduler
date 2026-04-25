@@ -80,17 +80,30 @@ run_indexing_task() {
     return $?
 }
 
-# Kill an entire process tree: SIGTERM first, SIGKILL after grace period
-# Args: PID
-# Refuses invalid/reserved PIDs:
-#   - empty / non-numeric: malformed input from DB or upstream caller
-#   - 0: 'kill 0' broadcasts to the current process group (scheduler suicide)
-#   - 1: init/systemd; pgrep -P 1 enumerates every direct child of init,
-#        so blindly killing them would tear down unrelated system services.
+# Kill an entire process tree: SIGTERM first, SIGKILL after grace period.
+# Args: PID [EXPECTED_STARTTIME]
+#
+# Refuses invalid/reserved PIDs (empty / non-numeric / <=1) — see comments
+# above the regex for the threats those represent.
+#
+# When EXPECTED_STARTTIME is supplied, the function re-verifies (PID,
+# starttime) identity immediately before each signal pass. This narrows
+# the TOCTOU window between an upstream identity check (e.g. stale-expire)
+# and the actual `kill` syscall: if the original process exited and the
+# kernel recycled the PID to an unrelated process during that gap,
+# verify_pid_identity now fails and the kill is aborted. The window is
+# not closed entirely (signals are still individual syscalls), but it
+# shrinks from "hundreds of microseconds of bash interpretation" to
+# "the gap between two consecutive kill calls".
 kill_process_tree() {
     local ROOT_PID=$1
+    local EXPECTED_STARTTIME=$2
     if ! [[ "$ROOT_PID" =~ ^[0-9]+$ ]] || [ "$ROOT_PID" -le 1 ]; then
         echo "[Error] kill_process_tree: refusing invalid/reserved PID '$ROOT_PID'" >&2
+        return 1
+    fi
+    if [ -n "$EXPECTED_STARTTIME" ] && ! verify_pid_identity "$ROOT_PID" "$EXPECTED_STARTTIME"; then
+        echo "[Warning] kill_process_tree: PID $ROOT_PID identity check failed before SIGTERM, aborting kill." >&2
         return 1
     fi
     local DESCENDANTS
@@ -107,8 +120,18 @@ kill_process_tree() {
         kill -TERM "$PID" 2>/dev/null
     done
 
-    # Grace period
-    sleep 3
+    # Grace period — generous enough to span timeout(1)'s own --kill-after
+    # escalation so SIGTERM-respecting workloads can finish cleanup before
+    # we escalate to SIGKILL.
+    sleep "${KILL_GRACE_SEC:-10}"
+
+    # Re-verify identity once more before SIGKILL — last chance to bail
+    # out if the original process exited and the PID was recycled during
+    # the grace period.
+    if [ -n "$EXPECTED_STARTTIME" ] && ! verify_pid_identity "$ROOT_PID" "$EXPECTED_STARTTIME"; then
+        echo "[Warning] kill_process_tree: PID $ROOT_PID identity check failed before SIGKILL, aborting." >&2
+        return 1
+    fi
 
     # SIGKILL any survivors
     for PID in $ALL_PIDS_REVERSED $ROOT_PID; do
@@ -399,6 +422,16 @@ COMMIT;")
         done
     }
 
+    # Detect legacy RUNNING rows lacking pid_starttime (left over from a
+    # pre-(PID,starttime) scheduler version). They cannot be identity-verified
+    # and will be marked ORPHANED below; surface a single explicit log line
+    # so the operator knows the cause is a one-shot upgrade artifact, not a
+    # routine recovery failure.
+    LEGACY_COUNT=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE status='RUNNING' AND pid IS NOT NULL AND pid_starttime IS NULL;")
+    if [ -n "$LEGACY_COUNT" ] && [ "$LEGACY_COUNT" -gt 0 ]; then
+        log "[Migration] Found $LEGACY_COUNT legacy RUNNING job(s) without recorded starttime. They will be marked ORPHANED (no kill issued). If their underlying processes are still running, terminate them manually or wait for stale auto-expire."
+    fi
+
     # Attempt to recover previously RUNNING jobs by checking process identity.
     # We compare the recorded (PID, starttime) tuple against /proc — comm
     # alone was insufficient because common names like 'bash'/'sleep' produce
@@ -459,10 +492,15 @@ COMMIT;")
                 # (default 20h) the original PID has almost certainly been recycled
                 # to a different process; killing it blindly would tear down an
                 # unrelated process tree.
-                if [ -n "$JPID" ] && [ -n "$JSTART" ] && verify_pid_identity "$JPID" "$JSTART"; then
-                    kill_process_tree "$JPID"
+                if [ -n "$JPID" ] && [ -n "$JSTART" ]; then
+                    # Pass starttime so kill_process_tree re-verifies identity
+                    # immediately before SIGTERM and again before SIGKILL,
+                    # narrowing the TOCTOU window if the PID was recycled
+                    # between this select and the actual kill syscalls.
+                    kill_process_tree "$JPID" "$JSTART" || \
+                        log "[Warning] Skipped kill for $JCNAME: identity check failed (PID=$JPID likely recycled)."
                 elif [ -n "$JPID" ]; then
-                    log "[Warning] Skipping kill for $JCNAME: PID=$JPID identity check failed (missing starttime or PID recycled)."
+                    log "[Warning] Skipping kill for $JCNAME: PID=$JPID has no recorded starttime (legacy row)."
                 fi
                 $DB_QUERY "UPDATE jobs SET status='TIMEOUT', end_time=datetime('now', 'localtime'), duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER), message='Stale auto-expired' WHERE id=$JID;"
                 unset BG_PIDS["$JCNAME"] 2>/dev/null
