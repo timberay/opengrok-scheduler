@@ -20,17 +20,28 @@ $DB_QUERY "INSERT INTO services (container_name, priority) VALUES ('orphan-test-
 SVC_LIVE=$($DB_QUERY "SELECT id FROM services WHERE container_name='orphan-test-live';")
 SVC_DEAD=$($DB_QUERY "SELECT id FROM services WHERE container_name='orphan-test-dead';")
 
+# Apply migrations so pid_starttime column exists
+"$PROJECT_ROOT/bin/migrate_db.sh" >/dev/null 2>&1
+
+# Source monitor.sh so we can capture the live PID's starttime via the
+# same helper recovery uses. Without a matching starttime the new
+# (PID, starttime) identity check would (correctly) reject the row.
+source "$PROJECT_ROOT/bin/monitor.sh" >/dev/null 2>&1
+
 # 3. Start a background process that will stay alive
 sleep 120 &
 LIVE_PID=$!
+sleep 0.1
+LIVE_START=$(get_pid_starttime "$LIVE_PID")
 DEAD_PID=99999
+DEAD_START=12345   # arbitrary; /proc/99999 should not exist anyway
 
-echo "[Setup] Live PID: $LIVE_PID (should be alive)"
-echo "[Setup] Dead PID: $DEAD_PID (doesn't exist)"
+echo "[Setup] Live PID: $LIVE_PID starttime=$LIVE_START (should be alive)"
+echo "[Setup] Dead PID: $DEAD_PID starttime=$DEAD_START (doesn't exist)"
 
-# 4. Insert both jobs as RUNNING
-$DB_QUERY "INSERT INTO jobs (service_id, status, pid, start_time) VALUES ($SVC_LIVE, 'RUNNING', $LIVE_PID, datetime('now', 'localtime'));"
-$DB_QUERY "INSERT INTO jobs (service_id, status, pid, start_time) VALUES ($SVC_DEAD, 'RUNNING', $DEAD_PID, datetime('now', 'localtime'));"
+# 4. Insert both jobs as RUNNING with PID + starttime tuples
+$DB_QUERY "INSERT INTO jobs (service_id, status, pid, pid_starttime, start_time) VALUES ($SVC_LIVE, 'RUNNING', $LIVE_PID, $LIVE_START, datetime('now', 'localtime'));"
+$DB_QUERY "INSERT INTO jobs (service_id, status, pid, pid_starttime, start_time) VALUES ($SVC_DEAD, 'RUNNING', $DEAD_PID, $DEAD_START, datetime('now', 'localtime'));"
 
 # 5. Trigger scheduler recovery by running it briefly (outside working hours)
 export START_TIME="23:00"
