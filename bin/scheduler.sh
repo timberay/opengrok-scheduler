@@ -372,6 +372,17 @@ COMMIT;")
                        duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER),
                        message='Scheduler shutdown' WHERE pid=$PID AND status='RUNNING';"
         done
+        # Close the in-flight run (if any) so a future scheduler restart
+        # does not see a stale RUNNING row and refuse to open a fresh run
+        # on the next window entry. Read from DB (not $CURRENT_RUN_ID)
+        # because the trap may fire after a PARTIAL-close has already
+        # cleared the cached id.
+        local OPEN_RUN
+        OPEN_RUN=$(run_current_id)
+        if [ -n "$OPEN_RUN" ]; then
+            log "Closing run #$OPEN_RUN as ABORTED (scheduler shutdown)."
+            run_close "$OPEN_RUN" ABORTED
+        fi
         log "Shutdown complete."
         exit 0
     }
