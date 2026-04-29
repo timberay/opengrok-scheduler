@@ -176,9 +176,20 @@ Run these games to make sure the helper is working:
 ./tests/test_idle_timeout.sh        # Check if idle jobs (no CPU activity) are detected and stopped
 ./tests/test_sigterm_cleanup.sh     # Check if the helper cleans up on shutdown signal
 ./tests/test_error_skip.sh          # Check FAILED/TIMEOUT jobs are excluded from next-job retry pool within the current run
+./tests/test_dedup_by_run.sh        # Check auto-cycle dedup is scoped to run_id, replacing the 23h rolling window
+
+# Run Lifecycle (cycle-based history)
+./tests/test_runs_schema.sh             # Check runs table + jobs.run_id migration is idempotent
+./tests/test_run_lifecycle.sh           # Check run opens on window entry and closes COMPLETED/PARTIAL naturally
+./tests/test_run_aborted_on_shutdown.sh # Check the open run is closed ABORTED on cleanup_and_exit
+./tests/test_run_recovery.sh            # Check stale RUNNING runs are recovered to ABORTED on startup
+./tests/test_manual_run_id.sh           # Check --service jobs pin run_id=NULL (excluded from cycle counters)
+./tests/test_init_semantics.sh          # Check --init aborts the current run only (non-destructive)
+./tests/test_status_runs.sh             # Check --status reports the latest run summary and counters
+./tests/test_retention.sh               # Check retention keeps MAX(RUN_RETENTION_MIN, RUN_RETENTION_DAYS)
 
 # Command Options
-./tests/test_init_option.sh         # Check if the "start fresh" command works
+./tests/test_init_option.sh         # Check the run-abort behavior of --init (and --purge-all wipe path)
 ./tests/test_service_option.sh      # Check if running one box right away works
 ./tests/test_status_output.sh       # Check the status reports
 
