@@ -15,6 +15,11 @@ This is a Bash-based helper that organizes batch jobs for more than 70 service b
 - **Idle Detection**: It samples CPU time across the entire process tree (parent + all child processes) to detect truly idle jobs. If a job's CPU time stops changing for `JOB_IDLE_TIMEOUT` seconds, it is terminated. This prevents false idle detection when a parent process spawns child processes (e.g. Docker exec, CLI tools) and appears idle while children are still working.
 - **Process Usage**: It counts how many other programs are running or waiting.
 - **Notebook Management (SQLite3)**: It keeps the list of boxes, rules, and history in a small notebook file.
+- **Cycle-Based History (Runs)**: Each scheduling cycle is recorded as one row in the `runs` table, replacing the previous timestamp-based "last 23 hours" model. A run opens on entry to the working window and closes when:
+  - all active services have a job row in that run (`COMPLETED`),
+  - the working window ends with services still pending (`PARTIAL`),
+  - the scheduler shuts down or recovers from a crash (`ABORTED`).
+  Manual `--service <container>` jobs run outside any cycle (their `run_id` is `NULL`) and are retained per a separate day-based rule. Retention keeps `MAX(RUN_RETENTION_MIN runs, RUN_RETENTION_DAYS days)`.
 - **Background Work**: It can start batch jobs in the background so it can do more than one thing at a time.
 - **Sequential Execution (--sequence)**: If you prefer to run only one task at a time, use the `--sequence` flag to wait for the current job to finish before starting the next one.
 - **Concurrency Cap (MAX_CONCURRENT_JOBS)**: It limits the number of jobs that can run at the same time (default 3). This stops the server from being overloaded when several jobs finish the light "download" stage together and suddenly all start the heavy "indexing" stage. Applies to both the scheduled loop and `--service` manual triggers, and is race-safe across both paths.
@@ -93,15 +98,30 @@ If you want to start one box right away, no matter what time it is:
 ```
 
 ### Check the Status (--status)
-See a summary of what the helper is doing, including the real-time process state (like RUNNING, SLEEPING, or DISK_WAIT):
+See a summary of what the helper is doing, including the real-time process state (like RUNNING, SLEEPING, or DISK_WAIT). The header shows the current/most-recent run with per-status counts (`C/F/T/O` = Completed / Failed / Timeout / Orphaned):
 ```bash
 ./bin/scheduler.sh --status
 ```
 
-### Start Fresh (--init)
-Clear the diary for the last 23 hours:
+Example header line:
+```
+Run #1 [COMPLETED, trigger=auto] 2026-04-30 00:15:03 ~ 2026-04-30 01:45:03 | 3/3 done (C=2 F=1 T=0 O=0)
+```
+
+### Recover a Stuck Cycle (--init)
+Close the in-flight run as `ABORTED` and exit. Past runs and their job rows are
+preserved. Use this when a cycle is stuck and you want the next start to open a
+fresh run cleanly:
 ```bash
 ./bin/scheduler.sh --init
+```
+
+### Wipe All History (--purge-all)
+Total wipe of all runs and jobs (services config preserved). Use this only when
+you genuinely want to discard all history. The previous destructive `--init`
+behavior was renamed to this flag in v1.1:
+```bash
+./bin/scheduler.sh --purge-all
 ```
 
 ### Run Jobs One by One (--sequence)
@@ -125,6 +145,9 @@ You can change rules in the `.env` file. The helper reads this file every time i
 | `JOB_TIMEOUT_SEC` | Max allowed execution time for a job (seconds) | `36000` |
 | `JOB_IDLE_TIMEOUT` | How long a job can be idle before timeout (seconds, 0=disabled) | `3600` |
 | `LOG_RETENTION_DAYS` | How many days to keep old log files | `30` |
+| `RUN_RETENTION_MIN` | Minimum number of finished runs to keep | `90` |
+| `RUN_RETENTION_DAYS` | Minimum days of run history to keep. Effective retention is `MAX(RUN_RETENTION_MIN runs, RUN_RETENTION_DAYS days)` | `90` |
+| `MANUAL_JOB_RETENTION_DAYS` | How long manual `--service` jobs (no `run_id`) are kept | `30` |
 | `KILL_GRACE_SEC` | Seconds between SIGTERM and SIGKILL when killing a job tree (allows graceful cleanup) | `10` |
 | `IOWAIT_THRESHOLD` | Max allowed I/O Wait (%) | `20` |
 | `SWAP_THRESHOLD` | Max allowed Swap usage (%) | `50` |
@@ -152,7 +175,7 @@ Run these games to make sure the helper is working:
 ./tests/test_concurrency_cap.sh     # Check that MAX_CONCURRENT_JOBS caps running jobs in both loop and --service paths
 ./tests/test_idle_timeout.sh        # Check if idle jobs (no CPU activity) are detected and stopped
 ./tests/test_sigterm_cleanup.sh     # Check if the helper cleans up on shutdown signal
-./tests/test_error_skip.sh          # Check FAILED/TIMEOUT jobs are excluded from next-job retry pool within the 23h window
+./tests/test_error_skip.sh          # Check FAILED/TIMEOUT jobs are excluded from next-job retry pool within the current run
 
 # Command Options
 ./tests/test_init_option.sh         # Check if the "start fresh" command works
