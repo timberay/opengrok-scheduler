@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at      DATETIME NOT NULL,
     ended_at        DATETIME,
     status          TEXT NOT NULL CHECK(status IN ('RUNNING','COMPLETED','PARTIAL','ABORTED')),
-    trigger         TEXT NOT NULL DEFAULT 'auto' CHECK(trigger IN ('auto','manual','init')),
+    triggered_by    TEXT NOT NULL DEFAULT 'auto' CHECK(triggered_by IN ('auto','manual','init')),
     total_services    INTEGER,
     completed_count   INTEGER DEFAULT 0,
     failed_count      INTEGER DEFAULT 0,
