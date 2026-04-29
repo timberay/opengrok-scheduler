@@ -238,26 +238,46 @@ if [[ "$1" != "--no-run" ]]; then
     if [[ "$1" == "--status" ]]; then
         echo "[Batch Job Execution Summary]"
         echo "-------------------------------------------------------------------------------------------------------------"
+
+        # Latest run summary on a single line, if a run exists
+        RUN_LINE=$($DB_QUERY "SELECT id, status, triggered_by, started_at, ended_at, completed_count, failed_count, timeout_count, orphaned_count, total_services FROM runs ORDER BY id DESC LIMIT 1;")
+        if [ -n "$RUN_LINE" ]; then
+            IFS='|' read -r RID RST RTR RSTART REND RC RF RT RO RTOT <<< "$RUN_LINE"
+            DONE=$((RC + RF + RT + RO))
+            printf "Run #%s [%s, trigger=%s] %s ~ %s | %s/%s done (C=%s F=%s T=%s O=%s)\n" \
+                "$RID" "$RST" "$RTR" "${RSTART:--}" "${REND:--}" "$DONE" "${RTOT:-?}" "$RC" "$RF" "$RT" "$RO"
+            echo "-------------------------------------------------------------------------------------------------------------"
+        fi
+
         printf "%-25s | %-12s | %-10s | %-20s | %-12s | %-20s\n" "Service Name" "Status" "Process" "Start Time" "Duration" "Message"
         echo "-------------------------------------------------------------------------------------------------------------"
-        
-        # Filter query results based on the last 23 hours
-        QUERY="SELECT s.container_name, j.status, COALESCE(j.process_state, '-'), j.start_time, j.duration, j.message 
-               FROM services s 
-               LEFT JOIN jobs j ON s.id = j.service_id 
-               WHERE (j.start_time > datetime('now', 'localtime', '-23 hours') OR j.start_time IS NULL)
-               ORDER BY j.start_time DESC LIMIT 50;"
-        
+
+        # Per-service table — scoped to the latest run if one exists, else last 50 rows
+        if [ -n "$RID" ]; then
+            QUERY="SELECT s.container_name, j.status, COALESCE(j.process_state, '-'), j.start_time, j.duration, j.message
+                   FROM services s
+                   LEFT JOIN jobs j ON s.id = j.service_id AND j.run_id = $RID
+                   ORDER BY (j.start_time IS NULL), j.start_time DESC LIMIT 100;"
+        else
+            QUERY="SELECT s.container_name, j.status, COALESCE(j.process_state, '-'), j.start_time, j.duration, j.message
+                   FROM services s
+                   LEFT JOIN jobs j ON s.id = j.service_id
+                   ORDER BY j.start_time DESC LIMIT 50;"
+        fi
+
         $DB_QUERY "$QUERY" | while IFS='|' read -r name status proc_state start duration msg; do
             [[ -z "$name" ]] && continue
             F_DURATION=$(format_duration "$duration")
             printf "%-25s | %-12s | %-10s | %-20s | %-12s | %-20s\n" "$name" "${status:-WAITING}" "$proc_state" "${start:--}" "$F_DURATION" "${msg:--}"
         done
         echo "-------------------------------------------------------------------------------------------------------------"
-        
+
         TOTAL=$($DB_QUERY "SELECT count(*) FROM services;")
-        DONE=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='COMPLETED' AND start_time > datetime('now', 'localtime', '-23 hours');")
-        echo "Total: $TOTAL | Done (Last 23h): $DONE"
+        if [ -n "$RID" ]; then
+            echo "Total Services: $TOTAL | Run #$RID done: $DONE/$RTOT"
+        else
+            echo "Total Services: $TOTAL | (no runs yet)"
+        fi
         exit 0
     fi
 
