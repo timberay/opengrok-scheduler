@@ -62,4 +62,38 @@ RUN3=$(run_open_if_none auto)
                        || { FAIL=$((FAIL+1)); echo "[Fail] new open did not create new id (got '$RUN3', prev '$RUN1')"; }
 
 cleanup_test_db "$TEST_DB"
+
+echo "--- triggered_by accepts auto / manual / init ---"
+TEST_DB2=$(setup_test_db); export DB_PATH="$TEST_DB2"
+RID_A=$(run_open_if_none auto); run_close "$RID_A" COMPLETED
+RID_M=$(run_open_if_none manual); run_close "$RID_M" COMPLETED
+RID_I=$(run_open_if_none init); run_close "$RID_I" COMPLETED
+
+T_A=$($DB_QUERY "SELECT triggered_by FROM runs WHERE id=$RID_A;")
+T_M=$($DB_QUERY "SELECT triggered_by FROM runs WHERE id=$RID_M;")
+T_I=$($DB_QUERY "SELECT triggered_by FROM runs WHERE id=$RID_I;")
+assert_eq "auto persists" "auto" "$T_A"
+assert_eq "manual persists" "manual" "$T_M"
+assert_eq "init persists" "init" "$T_I"
+
+# Invalid value rejected
+if run_open_if_none bogus 2>/dev/null; then
+    FAIL=$((FAIL+1)); echo "[Fail] bogus triggered_by accepted (should have rejected)"
+else
+    PASS=$((PASS+1)); echo "[Pass] bogus triggered_by rejected"
+fi
+cleanup_test_db "$TEST_DB2"
+
+echo "--- existing RUNNING row is honored (recovery semantics) ---"
+TEST_DB3=$(setup_test_db); export DB_PATH="$TEST_DB3"
+$DB_QUERY "INSERT INTO runs(started_at, status, triggered_by, total_services) \
+           VALUES (datetime('now','localtime'), 'RUNNING', 'auto', 0);"
+EXISTING_ID=$($DB_QUERY "SELECT id FROM runs WHERE status='RUNNING';")
+RECOVERED=$(run_open_if_none auto)
+assert_eq "open returns existing crashed RUNNING run" "$EXISTING_ID" "$RECOVERED"
+
+ROW_COUNT=$($DB_QUERY "SELECT COUNT(*) FROM runs;")
+assert_eq "no extra row inserted on recovery" "1" "$ROW_COUNT"
+cleanup_test_db "$TEST_DB3"
+
 print_test_summary

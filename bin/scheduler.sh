@@ -65,30 +65,39 @@ format_duration() {
 # Run lifecycle helpers — cycle-based history.
 # Each "run" is one scheduling cycle: opened on window entry (idempotent),
 # closed when all services have a row OR the window ends OR the scheduler
-# shuts down. See ARCHITECTURE.md "Cycle history" for the full state machine.
+# shuts down. State machine: RUNNING → {COMPLETED | PARTIAL | ABORTED}.
 
 # Open a new run if none is currently RUNNING. Idempotent: returns the
-# existing run id when called repeatedly within the same cycle.
-# Args: $1 = triggered_by value ('auto' | 'init'). Defaults to 'auto'.
-# Stdout: the run id (integer).
+# existing run id when called repeatedly within the same cycle. Race-safe
+# under concurrent callers — the eligibility check (no other RUNNING run)
+# runs *inside* the IMMEDIATE-locked transaction via WHERE NOT EXISTS,
+# matching the job-admission pattern at the bottom of the main loop.
+# Args: $1 = triggered_by value ('auto' | 'manual' | 'init'). Defaults to 'auto'.
+# Stdout: the run id (integer). Returns non-zero on error (with empty stdout).
 run_open_if_none() {
     local TRIGGERED_BY="${1:-auto}"
-    local EXISTING
-    EXISTING=$($DB_QUERY "SELECT id FROM runs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1;")
-    if [ -n "$EXISTING" ]; then
-        echo "$EXISTING"
-        return 0
-    fi
-    # Snapshot the active service count at run start so the run row carries
-    # the cycle's intended denominator even if services are deactivated mid-run.
-    local NEW_ID
-    NEW_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
+    case "$TRIGGERED_BY" in
+        auto|manual|init) ;;
+        *) log "[Error] run_open_if_none: invalid triggered_by '$TRIGGERED_BY' (must be auto|manual|init)"; return 1 ;;
+    esac
+
+    local RESULT
+    RESULT=$($DB_QUERY "BEGIN IMMEDIATE; \
 INSERT INTO runs (started_at, status, triggered_by, total_services) \
-VALUES (datetime('now', 'localtime'), 'RUNNING', '$TRIGGERED_BY', \
-        (SELECT COUNT(*) FROM services WHERE is_active=1)); \
-SELECT last_insert_rowid(); \
-COMMIT;")
-    echo "$NEW_ID"
+SELECT datetime('now', 'localtime'), 'RUNNING', '$TRIGGERED_BY', \
+       (SELECT COUNT(*) FROM services WHERE is_active=1) \
+WHERE NOT EXISTS (SELECT 1 FROM runs WHERE status='RUNNING'); \
+SELECT CASE WHEN changes() > 0 \
+            THEN last_insert_rowid() \
+            ELSE (SELECT id FROM runs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1) \
+       END; \
+COMMIT;") || { log "[Error] run_open_if_none: db query failed"; return 1; }
+
+    if [ -z "$RESULT" ] || ! [[ "$RESULT" =~ ^[0-9]+$ ]]; then
+        log "[Error] run_open_if_none: unexpected DB result '$RESULT'"
+        return 1
+    fi
+    echo "$RESULT"
 }
 
 # Return the id of the currently RUNNING run, or empty if none.
@@ -98,7 +107,8 @@ run_current_id() {
 
 # Close a run: aggregate per-status job counts into the row, set ended_at,
 # and switch status. Args: $1 = run id, $2 = terminal status
-# (COMPLETED | PARTIAL | ABORTED).
+# (COMPLETED | PARTIAL | ABORTED). Returns non-zero if args are missing
+# or the DB call fails.
 run_close() {
     local RUN_ID="$1"
     local FINAL_STATUS="$2"
@@ -106,6 +116,10 @@ run_close() {
         log "[Error] run_close: missing args (run_id='$RUN_ID', status='$FINAL_STATUS')"
         return 1
     fi
+    case "$FINAL_STATUS" in
+        COMPLETED|PARTIAL|ABORTED) ;;
+        *) log "[Error] run_close: invalid status '$FINAL_STATUS' (must be COMPLETED|PARTIAL|ABORTED)"; return 1 ;;
+    esac
     $DB_QUERY "UPDATE runs SET
         status='$FINAL_STATUS',
         ended_at=datetime('now', 'localtime'),
@@ -113,7 +127,8 @@ run_close() {
         failed_count=(SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='FAILED'),
         timeout_count=(SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='TIMEOUT'),
         orphaned_count=(SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='ORPHANED')
-        WHERE id=$RUN_ID;"
+        WHERE id=$RUN_ID;" || { log "[Error] run_close: db update failed for run_id=$RUN_ID"; return 1; }
+    return 0
 }
 
 # Function to execute indexing task and return exit code
