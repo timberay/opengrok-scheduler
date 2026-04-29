@@ -120,4 +120,22 @@ assert_eq "natural completion sets completed_count=2" "2" "$C"
 
 cleanup_test_db "$TEST_DB4"
 
+echo "--- Window-exit / PARTIAL wiring ---"
+TEST_DB5=$(setup_test_db); export DB_PATH="$TEST_DB5"
+$DB_QUERY "INSERT INTO services(container_name) VALUES ('svc-a'),('svc-b');"
+
+# Open a run, complete only one of two services, then close PARTIAL
+RID=$(run_open_if_none auto)
+$DB_QUERY "INSERT INTO jobs(service_id, run_id, status, start_time, end_time) VALUES
+    (1, $RID, 'COMPLETED', datetime('now','localtime'), datetime('now','localtime'));"
+run_close "$RID" PARTIAL
+
+ST=$($DB_QUERY "SELECT status FROM runs WHERE id=$RID;")
+assert_eq "window exit close marks PARTIAL" "PARTIAL" "$ST"
+
+C=$($DB_QUERY "SELECT completed_count FROM runs WHERE id=$RID;")
+assert_eq "PARTIAL run aggregates partial completed_count" "1" "$C"
+
+cleanup_test_db "$TEST_DB5"
+
 print_test_summary

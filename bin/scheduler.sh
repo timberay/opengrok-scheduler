@@ -596,10 +596,15 @@ COMMIT;")
             # If we just exited the window with an open run that still has
             # incomplete services, mark it PARTIAL. (Natural-completion close
             # below would have already moved status off RUNNING.)
+            #
+            # Read from DB via run_current_id rather than the in-memory
+            # $CURRENT_RUN_ID — this path must survive a scheduler restart
+            # mid-night without leaking a stale RUNNING row.
             OPEN_RUN=$(run_current_id)
             if [ -n "$OPEN_RUN" ]; then
                 log "Window closed with run #$OPEN_RUN still open — marking PARTIAL."
                 run_close "$OPEN_RUN" PARTIAL
+                CURRENT_RUN_ID=""
             fi
             log "Outside working hours ($START ~ $END). Sleeping..."
         else
