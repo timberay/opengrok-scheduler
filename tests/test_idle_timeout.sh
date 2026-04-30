@@ -164,6 +164,13 @@ fi
 
 kill $SCHEDULER_PID 2>/dev/null
 wait $SCHEDULER_PID 2>/dev/null
+# Ensure no leaked dispatch wrappers survive past Case boundary. Under the
+# run_id-based dedup, the scheduler may re-dispatch a still-idle service in
+# a fresh run between idle-timeout kill and our SIGTERM, leaving a wrapper
+# subshell — which has `trap '' SIGTERM` — orphaned and holding the flock
+# FD. Match by the temp scheduler path so we only target this test's tree.
+pkill -KILL -f "$TEMP_SCHEDULER" 2>/dev/null
+sleep 1
 
 # --- Integration Test: JOB_IDLE_TIMEOUT=0 disables idle detection ---
 echo ""
@@ -194,6 +201,8 @@ fi
 
 kill $SCHEDULER_PID 2>/dev/null
 wait $SCHEDULER_PID 2>/dev/null
+pkill -KILL -f "$TEMP_SCHEDULER" 2>/dev/null
+sleep 1
 
 # --- Integration Test: Pure sleep (0 CPU) triggers idle timeout ---
 echo ""
@@ -231,6 +240,8 @@ fi
 
 kill $SCHEDULER_PID 2>/dev/null
 wait $SCHEDULER_PID 2>/dev/null
+pkill -KILL -f "$TEMP_SCHEDULER_ZEROCPU" 2>/dev/null
+sleep 1
 rm -f "$TEMP_SCHEDULER_ZEROCPU"
 
 # Cleanup

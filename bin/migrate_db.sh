@@ -49,6 +49,27 @@ add_column_if_missing "jobs" "pid" "INTEGER"
 add_column_if_missing "jobs" "pid_starttime" "INTEGER"
 add_column_if_missing "jobs" "process_state" "TEXT DEFAULT 'UNKNOWN'"
 
+# 3.1 Runs Table — cycle-based history (added 2026-04)
+echo "[Migration] Ensuring runs table exists..."
+migrate_query "CREATE TABLE IF NOT EXISTS runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      DATETIME NOT NULL,
+    ended_at        DATETIME,
+    status          TEXT NOT NULL CHECK(status IN ('RUNNING','COMPLETED','PARTIAL','ABORTED')),
+    triggered_by    TEXT NOT NULL DEFAULT 'auto' CHECK(triggered_by IN ('auto','manual','init')),
+    total_services  INTEGER,
+    completed_count INTEGER DEFAULT 0,
+    failed_count    INTEGER DEFAULT 0,
+    timeout_count   INTEGER DEFAULT 0,
+    orphaned_count  INTEGER DEFAULT 0
+);"
+migrate_query "CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);"
+migrate_query "CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);"
+
+# 3.2 Jobs.run_id — FK into runs, plus dedup-query index
+add_column_if_missing "jobs" "run_id" "INTEGER REFERENCES runs(id)"
+migrate_query "CREATE INDEX IF NOT EXISTS idx_jobs_run_id ON jobs(run_id);"
+
 # 3. Heartbeat Table Migration
 echo "[Migration] Ensuring heartbeat table exists..."
 migrate_query "CREATE TABLE IF NOT EXISTS heartbeat (id INTEGER PRIMARY KEY, last_pulse DATETIME);"

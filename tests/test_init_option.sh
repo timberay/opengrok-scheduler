@@ -1,12 +1,14 @@
 #!/bin/bash
 
 # tests/test_init_option.sh
-# --init option functionality test
+# CLI option test for the destructive-wipe path.
+# Under cycle-based history semantics, --init no longer wipes jobs;
+# the explicit --purge-all flag is the destructive operation.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$PROJECT_ROOT/tests/test_helper.sh"
 
-echo "[Test] CLI --init Option Test Started..."
+echo "[Test] CLI --init / --purge-all Option Test Started..."
 
 # 1. Setup isolated test DB
 TEST_DB=$(setup_test_db)
@@ -31,20 +33,33 @@ else
     exit 1
 fi
 
-# 4. Run --init
+# 4. Run --init — must NOT delete jobs (no in-flight run here, so it's a no-op)
 $PROJECT_ROOT/bin/scheduler.sh --init
 
-# 5. Verify ALL records deleted
-COUNT_AFTER=$($DB_QUERY "SELECT count(*) FROM jobs;")
-if [ "$COUNT_AFTER" -eq 0 ]; then
-    echo "[Pass] All records cleared successfully."
+# 5. Verify --init preserved jobs (non-destructive semantics)
+COUNT_AFTER_INIT=$($DB_QUERY "SELECT count(*) FROM jobs;")
+if [ "$COUNT_AFTER_INIT" -eq "$COUNT_BEFORE" ]; then
+    echo "[Pass] --init preserved job records ($COUNT_AFTER_INIT)."
 else
-    echo "[Fail] Records still exist ($COUNT_AFTER)."
+    echo "[Fail] --init unexpectedly modified job records ($COUNT_BEFORE -> $COUNT_AFTER_INIT)."
+    cleanup_test_db "$TEST_DB"
+    exit 1
+fi
+
+# 6. Run --purge-all — this is the explicit destructive wipe
+$PROJECT_ROOT/bin/scheduler.sh --purge-all
+
+# 7. Verify ALL job records deleted
+COUNT_AFTER_PURGE=$($DB_QUERY "SELECT count(*) FROM jobs;")
+if [ "$COUNT_AFTER_PURGE" -eq 0 ]; then
+    echo "[Pass] --purge-all cleared all records."
+else
+    echo "[Fail] Records still exist after --purge-all ($COUNT_AFTER_PURGE)."
     cleanup_test_db "$TEST_DB"
     exit 1
 fi
 
 cleanup_test_db "$TEST_DB"
 
-echo "[Success] --init option test passed!"
+echo "[Success] --init / --purge-all option test passed!"
 exit 0

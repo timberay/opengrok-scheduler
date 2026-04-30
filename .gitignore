@@ -28,3 +28,11 @@ tmp/
 .ruby-lsp/
 .vscode/
 .idea/
+
+# graphify knowledge graph (locally regenerable; large viz + cache)
+graphify-out/
+
+# Temp scheduler copies created by integration tests (EXIT-trap cleaned, but
+# may linger if a test crashes hard).
+bin/scheduler_test_*.sh
+bin/scheduler_smoke_*.sh

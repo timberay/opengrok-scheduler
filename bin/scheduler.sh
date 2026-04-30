@@ -62,6 +62,136 @@ format_duration() {
     printf "%dh %dm %ds" "$H" "$M" "$S"
 }
 
+# Run lifecycle helpers — cycle-based history.
+# Each "run" is one scheduling cycle: opened on window entry (idempotent),
+# closed when all services have a row OR the window ends OR the scheduler
+# shuts down. State machine: RUNNING → {COMPLETED | PARTIAL | ABORTED}.
+
+# Open a new run if none is currently RUNNING. Idempotent: returns the
+# existing run id when called repeatedly within the same cycle. Race-safe
+# under concurrent callers — the eligibility check (no other RUNNING run)
+# runs *inside* the IMMEDIATE-locked transaction via WHERE NOT EXISTS,
+# matching the job-admission pattern at the bottom of the main loop.
+# Args: $1 = triggered_by value ('auto' | 'manual' | 'init'). Defaults to 'auto'.
+# Stdout: the run id (integer). Returns non-zero on error (with empty stdout).
+run_open_if_none() {
+    local TRIGGERED_BY="${1:-auto}"
+    case "$TRIGGERED_BY" in
+        auto|manual|init) ;;
+        *) log "[Error] run_open_if_none: invalid triggered_by '$TRIGGERED_BY' (must be auto|manual|init)"; return 1 ;;
+    esac
+
+    local RESULT
+    RESULT=$($DB_QUERY "BEGIN IMMEDIATE; \
+INSERT INTO runs (started_at, status, triggered_by, total_services) \
+SELECT datetime('now', 'localtime'), 'RUNNING', '$TRIGGERED_BY', \
+       (SELECT COUNT(*) FROM services WHERE is_active=1) \
+WHERE NOT EXISTS (SELECT 1 FROM runs WHERE status='RUNNING'); \
+SELECT CASE WHEN changes() > 0 \
+            THEN last_insert_rowid() \
+            ELSE (SELECT id FROM runs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1) \
+       END; \
+COMMIT;") || { log "[Error] run_open_if_none: db query failed"; return 1; }
+
+    if [ -z "$RESULT" ] || ! [[ "$RESULT" =~ ^[0-9]+$ ]]; then
+        log "[Error] run_open_if_none: unexpected DB result '$RESULT'"
+        return 1
+    fi
+    echo "$RESULT"
+}
+
+# Return the id of the currently RUNNING run, or empty if none.
+run_current_id() {
+    $DB_QUERY "SELECT id FROM runs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1;"
+}
+
+# Close a run: aggregate per-status job counts into the row, set ended_at,
+# and switch status. Args: $1 = run id, $2 = terminal status
+# (COMPLETED | PARTIAL | ABORTED). Returns non-zero if args are missing
+# or the DB call fails.
+run_close() {
+    local RUN_ID="$1"
+    local FINAL_STATUS="$2"
+    if [ -z "$RUN_ID" ] || [ -z "$FINAL_STATUS" ]; then
+        log "[Error] run_close: missing args (run_id='$RUN_ID', status='$FINAL_STATUS')"
+        return 1
+    fi
+    case "$FINAL_STATUS" in
+        COMPLETED|PARTIAL|ABORTED) ;;
+        *) log "[Error] run_close: invalid status '$FINAL_STATUS' (must be COMPLETED|PARTIAL|ABORTED)"; return 1 ;;
+    esac
+    $DB_QUERY "UPDATE runs SET
+        status='$FINAL_STATUS',
+        ended_at=datetime('now', 'localtime'),
+        completed_count=(SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='COMPLETED'),
+        failed_count=(SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='FAILED'),
+        timeout_count=(SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='TIMEOUT'),
+        orphaned_count=(SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='ORPHANED')
+        WHERE id=$RUN_ID;" || { log "[Error] run_close: db update failed for run_id=$RUN_ID"; return 1; }
+    return 0
+}
+
+# Sweep stale RUNNING runs left over from a prior crashed scheduler. Mirrors
+# the ORPHANED-jobs recovery sweep below — both run unconditionally on
+# scheduler start. Idempotent: a second call is a no-op because the first
+# already moved every RUNNING row to ABORTED.
+run_recover_stale() {
+    local STALE
+    STALE=$($DB_QUERY "SELECT id FROM runs WHERE status='RUNNING';")
+    if [ -n "$STALE" ]; then
+        while read -r RID; do
+            [ -z "$RID" ] && continue
+            log "[Recovery] Closing stale RUNNING run #$RID as ABORTED."
+            run_close "$RID" ABORTED
+        done <<< "$STALE"
+    fi
+}
+
+# Daily retention sweep — keeps MAX(RUN_RETENTION_MIN runs, RUN_RETENTION_DAYS days)
+# of finished runs and their jobs. RUNNING runs are never touched. Manual jobs
+# (run_id IS NULL) follow MANUAL_JOB_RETENTION_DAYS independently. Idempotent.
+runs_retention_cleanup() {
+    local MIN_KEEP="${RUN_RETENTION_MIN:-90}"
+    local KEEP_DAYS="${RUN_RETENTION_DAYS:-90}"
+    local MANUAL_DAYS="${MANUAL_JOB_RETENTION_DAYS:-30}"
+
+    # A finished run is KEPT if it is in either retention set:
+    #   (a) the most-recent MIN_KEEP finished runs by id, OR
+    #   (b) within the last KEEP_DAYS by started_at.
+    # It is DELETED only when it falls outside BOTH sets — that is exactly
+    # MAX(N runs, X days) of preserved history. RUNNING runs are never touched.
+    # Tie-safe: identical timestamps stay together because membership in the
+    # top-N window is by id, not by timestamp comparison.
+    #
+    # Cascade is bounded: only jobs older than the day window are pruned when
+    # their run is missing. This avoids nuking jobs that reference a run row
+    # that will be inserted shortly (e.g. test seeds, or a race between the
+    # job-INSERT and the run-INSERT in a concurrent scenario).
+    $DB_QUERY "
+DELETE FROM runs
+WHERE status != 'RUNNING'
+  AND id NOT IN (
+      SELECT id FROM runs
+      WHERE status != 'RUNNING'
+      ORDER BY id DESC LIMIT $MIN_KEEP
+  )
+  AND started_at < datetime('now','localtime','-$KEEP_DAYS days');
+
+-- Cascade: remove old jobs whose run is gone (orphaned by the delete above).
+-- Bounded by the day window so we never touch fresh jobs whose run row may
+-- not have been written yet.
+DELETE FROM jobs
+WHERE run_id IS NOT NULL
+  AND start_time < datetime('now','localtime','-$KEEP_DAYS days')
+  AND run_id NOT IN (SELECT id FROM runs);
+
+-- Manual jobs follow their own day-based retention.
+DELETE FROM jobs
+WHERE run_id IS NULL
+  AND start_time < datetime('now','localtime','-$MANUAL_DAYS days');
+"
+}
+
 # Function to execute indexing task and return exit code
 run_indexing_task() {
     local CONTAINER_NAME=$1
@@ -153,41 +283,73 @@ if [[ "$1" != "--no-run" ]]; then
     if [[ "$1" == "--status" ]]; then
         echo "[Batch Job Execution Summary]"
         echo "-------------------------------------------------------------------------------------------------------------"
+
+        # Latest run summary on a single line, if a run exists
+        RUN_LINE=$($DB_QUERY "SELECT id, status, triggered_by, started_at, ended_at, completed_count, failed_count, timeout_count, orphaned_count, total_services FROM runs ORDER BY id DESC LIMIT 1;")
+        if [ -n "$RUN_LINE" ]; then
+            IFS='|' read -r RID RST RTR RSTART REND RC RF RT RO RTOT <<< "$RUN_LINE"
+            DONE=$((RC + RF + RT + RO))
+            printf "Run #%s [%s, trigger=%s] %s ~ %s | %s/%s done (C=%s F=%s T=%s O=%s)\n" \
+                "$RID" "$RST" "$RTR" "${RSTART:--}" "${REND:--}" "$DONE" "${RTOT:-?}" "$RC" "$RF" "$RT" "$RO"
+            echo "-------------------------------------------------------------------------------------------------------------"
+        fi
+
         printf "%-25s | %-12s | %-10s | %-20s | %-12s | %-20s\n" "Service Name" "Status" "Process" "Start Time" "Duration" "Message"
         echo "-------------------------------------------------------------------------------------------------------------"
-        
-        # Filter query results based on the last 23 hours
-        QUERY="SELECT s.container_name, j.status, COALESCE(j.process_state, '-'), j.start_time, j.duration, j.message 
-               FROM services s 
-               LEFT JOIN jobs j ON s.id = j.service_id 
-               WHERE (j.start_time > datetime('now', 'localtime', '-23 hours') OR j.start_time IS NULL)
-               ORDER BY j.start_time DESC LIMIT 50;"
-        
+
+        # Per-service table — scoped to the latest run if one exists, else last 50 rows
+        if [ -n "$RID" ]; then
+            QUERY="SELECT s.container_name, j.status, COALESCE(j.process_state, '-'), j.start_time, j.duration, j.message
+                   FROM services s
+                   LEFT JOIN jobs j ON s.id = j.service_id AND j.run_id = $RID
+                   ORDER BY (j.start_time IS NULL), j.start_time DESC LIMIT 100;"
+        else
+            QUERY="SELECT s.container_name, j.status, COALESCE(j.process_state, '-'), j.start_time, j.duration, j.message
+                   FROM services s
+                   LEFT JOIN jobs j ON s.id = j.service_id
+                   ORDER BY j.start_time DESC LIMIT 50;"
+        fi
+
         $DB_QUERY "$QUERY" | while IFS='|' read -r name status proc_state start duration msg; do
             [[ -z "$name" ]] && continue
             F_DURATION=$(format_duration "$duration")
             printf "%-25s | %-12s | %-10s | %-20s | %-12s | %-20s\n" "$name" "${status:-WAITING}" "$proc_state" "${start:--}" "$F_DURATION" "${msg:--}"
         done
         echo "-------------------------------------------------------------------------------------------------------------"
-        
+
         TOTAL=$($DB_QUERY "SELECT count(*) FROM services;")
-        DONE=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='COMPLETED' AND start_time > datetime('now', 'localtime', '-23 hours');")
-        echo "Total: $TOTAL | Done (Last 23h): $DONE"
+        if [ -n "$RID" ]; then
+            echo "Total Services: $TOTAL | Run #$RID done: $DONE/$RTOT"
+        else
+            echo "Total Services: $TOTAL | (no runs yet)"
+        fi
         exit 0
     fi
 
-    # Handle --init argument
+    # Handle --init argument — non-destructive: closes current run only.
     if [[ "$1" == "--init" ]]; then
-        log "Initializing all job records..."
-        # Check if any job is currently RUNNING
-        RUNNING_JOBS=$($DB_QUERY "SELECT count(*) FROM jobs WHERE status='RUNNING';")
-        if [ "$RUNNING_JOBS" -gt 0 ]; then
-            log "[Warning] There are $RUNNING_JOBS jobs currently in 'RUNNING' status."
-            log "Force initializing anyway..."
+        log "Aborting in-flight run (if any). History preserved."
+        OPEN_RUN=$($DB_QUERY "SELECT id FROM runs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1;")
+        if [ -n "$OPEN_RUN" ]; then
+            RUNNING_JOBS=$($DB_QUERY "SELECT count(*) FROM jobs WHERE run_id=$OPEN_RUN AND status='RUNNING';")
+            if [ "$RUNNING_JOBS" -gt 0 ]; then
+                log "[Warning] $RUNNING_JOBS jobs in run #$OPEN_RUN are still RUNNING in the DB."
+                log "Marking the run ABORTED. Live processes (if any) will be reaped on next scheduler start."
+            fi
+            $DB_QUERY "UPDATE runs SET status='ABORTED', ended_at=datetime('now','localtime') WHERE id=$OPEN_RUN;"
+            log "Run #$OPEN_RUN marked ABORTED."
+        else
+            log "No in-flight run to abort."
         fi
-        
-        $DB_QUERY "DELETE FROM jobs;"
-        log "All job records have been cleared."
+        exit 0
+    fi
+
+    # Handle --purge-all argument — total wipe (was the old --init behavior).
+    # Use this only when you genuinely want to discard ALL history.
+    if [[ "$1" == "--purge-all" ]]; then
+        log "[Warning] --purge-all: deleting ALL jobs and runs. This cannot be undone."
+        $DB_QUERY "DELETE FROM jobs; DELETE FROM runs;"
+        log "All jobs and runs cleared. Services table preserved (configuration is not history)."
         exit 0
     fi
 
@@ -220,6 +382,14 @@ if [[ "$1" != "--no-run" ]]; then
         fi
 
         # Atomic INSERT-if-under-cap: race-safe against main-loop scheduler
+        # NOTE: --service is an ad-hoc trigger; we deliberately leave run_id
+        # unset so SQLite defaults it to NULL. This keeps manual runs out of
+        # auto-cycle dedup (the j.run_id = $CURRENT_RUN_ID predicate is
+        # automatically false for NULL) and out of run-level statistics
+        # (completed_count/failed_count are scoped to a specific run_id).
+        # If you ever need to attribute a manual trigger to a cycle, prefer
+        # adding a 'manual' run via run_open_if_none "manual" rather than
+        # tagging this row with the auto-cycle's run_id.
         JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
 INSERT INTO jobs (service_id, status, start_time) \
 SELECT $S_ID, 'RUNNING', datetime('now', 'localtime') \
@@ -303,6 +473,17 @@ COMMIT;")
                        duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER),
                        message='Scheduler shutdown' WHERE pid=$PID AND status='RUNNING';"
         done
+        # Close the in-flight run (if any) so a future scheduler restart
+        # does not see a stale RUNNING row and refuse to open a fresh run
+        # on the next window entry. Read from DB (not $CURRENT_RUN_ID)
+        # because the trap may fire after a PARTIAL-close has already
+        # cleared the cached id.
+        local OPEN_RUN
+        OPEN_RUN=$(run_current_id)
+        if [ -n "$OPEN_RUN" ]; then
+            log "Closing run #$OPEN_RUN as ABORTED (scheduler shutdown)."
+            run_close "$OPEN_RUN" ABORTED
+        fi
         log "Shutdown complete."
         exit 0
     }
@@ -466,7 +647,13 @@ COMMIT;")
                    WHERE status='RUNNING'
                    AND (process_state IS NULL OR process_state NOT IN ('COMPLETED', 'FAILED'));"
     fi
-    
+
+    # Mirrors the ORPHANED-jobs sweep above: any leftover RUNNING run row from
+    # a crashed prior process is closed without touching that cycle's job
+    # rows, so a clean run can be opened on next window entry.
+    run_recover_stale
+
+    CURRENT_RUN_ID=""
     while true; do
         # Log Cleanup (Keep last N days)
         CUR_DATE=$(date +%Y%m%d)
@@ -474,6 +661,10 @@ COMMIT;")
             LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
             find "$LOG_DIR" -name "*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null
             log "Cleaned up logs older than ${LOG_RETENTION_DAYS} days."
+            # Cycle history retention — runs older than the policy are pruned,
+            # along with their jobs. Manual jobs follow a separate day-based rule.
+            runs_retention_cleanup
+            log "Cleaned up runs older than max(${RUN_RETENTION_MIN:-90} runs, ${RUN_RETENTION_DAYS:-90} days); manual jobs older than ${MANUAL_JOB_RETENTION_DAYS:-30} days."
             LAST_LOG_CLEANUP="$CUR_DATE"
         fi
 
@@ -521,26 +712,46 @@ COMMIT;")
             MAX_CONCURRENT=3
         fi
 
-        # 2. Check Time Range
+        # 2. Check Time Range — also tracks run lifecycle transitions.
         if ! check_time_range "$START" "$END" > /dev/null; then
+            # If we just exited the window with an open run that still has
+            # incomplete services, mark it PARTIAL. (Natural-completion close
+            # below would have already moved status off RUNNING.)
+            #
+            # Read from DB via run_current_id rather than the in-memory
+            # $CURRENT_RUN_ID — this path must survive a scheduler restart
+            # mid-night without leaking a stale RUNNING row.
+            OPEN_RUN=$(run_current_id)
+            if [ -n "$OPEN_RUN" ]; then
+                log "Window closed with run #$OPEN_RUN still open — marking PARTIAL."
+                run_close "$OPEN_RUN" PARTIAL
+                CURRENT_RUN_ID=""
+            fi
             log "Outside working hours ($START ~ $END). Sleeping..."
         else
-            # 3. Get Next Job (Exclude services already RUNNING or COMPLETED today)
-            QUERY="SELECT s.id FROM services s 
+            # Idempotent: opens a new run only if none is currently RUNNING.
+            CURRENT_RUN_ID=$(run_open_if_none auto)
+            if [ -z "$CURRENT_RUN_ID" ]; then
+                log "[Error] Failed to open or recover a run. Retrying in 30s..."
+                sleep 30
+                continue
+            fi
+
+            # 3. Get Next Job (Exclude services already attempted in this run)
+            QUERY="SELECT s.id FROM services s
                    LEFT JOIN (
-                       SELECT service_id, AVG(duration) as avg_duration 
-                       FROM jobs 
-                       WHERE status='COMPLETED' 
+                       SELECT service_id, AVG(duration) as avg_duration
+                       FROM jobs
+                       WHERE status='COMPLETED'
                        GROUP BY service_id
                    ) j_stats ON s.id = j_stats.service_id
                    WHERE s.is_active=1
                    AND NOT EXISTS (
                        SELECT 1 FROM jobs j
                        WHERE j.service_id = s.id
-                       AND j.start_time > datetime('now', 'localtime', '-23 hours')
-                       AND j.status IN ('RUNNING', 'COMPLETED', 'ORPHANED', 'FAILED', 'TIMEOUT')
+                       AND j.run_id = $CURRENT_RUN_ID
                    )
-                   ORDER BY s.priority DESC, COALESCE(j_stats.avg_duration, -1) DESC, s.container_name ASC 
+                   ORDER BY s.priority DESC, COALESCE(j_stats.avg_duration, -1) DESC, s.container_name ASC
                    LIMIT 1;"
             NEXT_SERVICE_ID=$($DB_QUERY "$QUERY")
             if [ $? -ne 0 ]; then
@@ -550,6 +761,13 @@ COMMIT;")
             fi
             
             if [ -z "$NEXT_SERVICE_ID" ]; then
+                # Natural completion: every active service has a row in this run.
+                # Close it COMPLETED so the next window entry opens a fresh run.
+                if [ -n "$CURRENT_RUN_ID" ]; then
+                    log "All tasks completed for run #$CURRENT_RUN_ID. Closing as COMPLETED."
+                    run_close "$CURRENT_RUN_ID" COMPLETED
+                    CURRENT_RUN_ID=""
+                fi
                 log "All tasks completed for today. Waiting..."
             else
                 CONTAINER_NAME=$($DB_QUERY "SELECT container_name FROM services WHERE id=$NEXT_SERVICE_ID;")
@@ -581,8 +799,8 @@ COMMIT;")
                     else
                         # 7. Execute Job — atomic INSERT-if-under-cap guards race with manual trigger (bin/scheduler.sh:180)
                         JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
-INSERT INTO jobs (service_id, status, start_time) \
-SELECT $NEXT_SERVICE_ID, 'RUNNING', datetime('now', 'localtime') \
+INSERT INTO jobs (service_id, run_id, status, start_time) \
+SELECT $NEXT_SERVICE_ID, $CURRENT_RUN_ID, 'RUNNING', datetime('now', 'localtime') \
 WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MAX_CONCURRENT; \
 SELECT CASE WHEN changes() > 0 THEN last_insert_rowid() ELSE 0 END; \
 COMMIT;")

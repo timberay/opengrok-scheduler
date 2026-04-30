@@ -20,6 +20,7 @@ load_env() {
             IOWAIT_THRESHOLD SWAP_THRESHOLD INODE_THRESHOLD
             DISK_DEVICE NET_INTERFACE MAX_BANDWIDTH
             MAX_CONCURRENT_JOBS KILL_GRACE_SEC
+            RUN_RETENTION_MIN RUN_RETENTION_DAYS MANUAL_JOB_RETENTION_DAYS
         )
         declare -A _SAVED
         for var in "${_SAVED_VARS[@]}"; do
@@ -57,6 +58,15 @@ resolve_paths() {
 # Initial Execution
 load_env
 resolve_paths
+
+# Cycle history retention (used by daily cleanup in scheduler main loop).
+# Keep at least RUN_RETENTION_MIN runs OR RUN_RETENTION_DAYS days of runs,
+# whichever preserves more history. Manual jobs (run_id IS NULL) are kept
+# for MANUAL_JOB_RETENTION_DAYS days.
+RUN_RETENTION_MIN=${RUN_RETENTION_MIN:-90}
+RUN_RETENTION_DAYS=${RUN_RETENTION_DAYS:-90}
+MANUAL_JOB_RETENTION_DAYS=${MANUAL_JOB_RETENTION_DAYS:-30}
+export RUN_RETENTION_MIN RUN_RETENTION_DAYS MANUAL_JOB_RETENTION_DAYS
 
 # --- Input Validation Helpers ---
 
