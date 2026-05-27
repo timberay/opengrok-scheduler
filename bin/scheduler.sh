@@ -445,7 +445,20 @@ if [[ "$1" != "--no-run" ]]; then
             MANUAL_MAX_CONCURRENT=3
         fi
 
-        # Atomic INSERT-if-under-cap: race-safe against main-loop scheduler
+        # Atomic INSERT-if-under-cap AND-not-already-running: race-safe against
+        # main-loop scheduler AND against another concurrent --service trigger
+        # for the same service.
+        #
+        # The per-service NOT EXISTS guard is the critical defense against
+        # duplicate dispatch: the --service branch bypasses the main-loop's
+        # advisory flock (it exits before the lock acquisition path), and
+        # BG_PIDS is per-process so the manual invocation cannot observe
+        # the main loop's in-flight set. Without this guard, an operator
+        # running `--service svc-X` while the main loop is already running
+        # svc-X would insert a second RUNNING jobs row and spawn a second
+        # indexing task against the same target — exactly the thundering
+        # herd the concurrency cap was supposed to prevent.
+        #
         # NOTE: --service is an ad-hoc trigger; we deliberately leave run_id
         # unset so SQLite defaults it to NULL. This keeps manual runs out of
         # auto-cycle dedup (the j.run_id = $CURRENT_RUN_ID predicate is
@@ -457,7 +470,8 @@ if [[ "$1" != "--no-run" ]]; then
         JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
 INSERT INTO jobs (service_id, status, start_time) \
 SELECT $S_ID, 'RUNNING', datetime('now', 'localtime') \
-WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MANUAL_MAX_CONCURRENT; \
+WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MANUAL_MAX_CONCURRENT \
+  AND NOT EXISTS (SELECT 1 FROM jobs WHERE service_id=$S_ID AND status='RUNNING'); \
 SELECT CASE WHEN changes() > 0 THEN last_insert_rowid() ELSE 0 END; \
 COMMIT;")
 
@@ -467,8 +481,16 @@ COMMIT;")
         fi
 
         if [ "$JOB_ID" = "0" ]; then
-            CURRENT=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE status='RUNNING';")
-            log "[Error] Concurrency cap reached: $CURRENT/$MANUAL_MAX_CONCURRENT jobs already running. Cannot start '$S_NAME'."
+            # Distinguish the two refusal reasons. Check the per-service
+            # guard first: if a RUNNING row exists for this service, that
+            # is the more specific (and more actionable) diagnostic.
+            ALREADY=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE service_id=$S_ID AND status='RUNNING';")
+            if [ "${ALREADY:-0}" -gt 0 ]; then
+                log "[Error] Service already running: '$S_NAME' has a RUNNING job. Refusing duplicate dispatch."
+            else
+                CURRENT=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE status='RUNNING';")
+                log "[Error] Concurrency cap reached: $CURRENT/$MANUAL_MAX_CONCURRENT jobs already running. Cannot start '$S_NAME'."
+            fi
             exit 1
         fi
 
@@ -889,11 +911,21 @@ COMMIT;")
                         log "[Reap] BG_PID for $CONTAINER_NAME (PID=${BG_PIDS[$CONTAINER_NAME]}) is dead but unreaped; reaping before re-dispatch."
                         reap_bg_processes
                     else
-                        # 7. Execute Job — atomic INSERT-if-under-cap guards race with manual trigger (bin/scheduler.sh:180)
+                        # 7. Execute Job — atomic INSERT-if-under-cap guards race with manual trigger (bin/scheduler.sh:180).
+                        # The NOT EXISTS clause mirrors the per-service guard
+                        # in the --service path: within a single run, the
+                        # NEXT_SERVICE_ID query already excludes services
+                        # that have any row in this run, so this guard is
+                        # belt-and-braces for recovery edge cases where
+                        # BG_PIDS lost track of a service whose old RUNNING
+                        # row was not yet finalised (or for a future caller
+                        # that triggers main-loop dispatch outside the
+                        # NEXT_SERVICE_ID dedup path).
                         JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
 INSERT INTO jobs (service_id, run_id, status, start_time) \
 SELECT $NEXT_SERVICE_ID, $CURRENT_RUN_ID, 'RUNNING', datetime('now', 'localtime') \
-WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MAX_CONCURRENT; \
+WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MAX_CONCURRENT \
+  AND NOT EXISTS (SELECT 1 FROM jobs WHERE service_id=$NEXT_SERVICE_ID AND status='RUNNING'); \
 SELECT CASE WHEN changes() > 0 THEN last_insert_rowid() ELSE 0 END; \
 COMMIT;")
 
