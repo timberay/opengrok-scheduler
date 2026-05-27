@@ -131,6 +131,29 @@ run_close() {
     return 0
 }
 
+# Gate for the natural-completion close: a run may be closed COMPLETED only
+# when every active service has a row in it AND no row is still RUNNING.
+# The "every service has a row" half is checked by the main loop's
+# NEXT_SERVICE_ID query (returns empty when satisfied). This helper checks
+# the second half so the main loop does not prematurely close a run while
+# background jobs are still in flight — which previously let a fresh run
+# open on the next iteration and re-dispatch the same services.
+# Args: $1 = run id. Returns 0 (closable) when in-flight count is zero, 1
+# otherwise. Treats a missing/non-numeric count as "in-flight" defensively
+# so a transient DB hiccup never causes a wrongful close.
+run_can_close_naturally() {
+    local RUN_ID="$1"
+    if [ -z "$RUN_ID" ]; then
+        return 1
+    fi
+    local IN_FLIGHT
+    IN_FLIGHT=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE run_id=$RUN_ID AND status='RUNNING';")
+    if ! [[ "$IN_FLIGHT" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    [ "$IN_FLIGHT" -eq 0 ]
+}
+
 # Sweep stale RUNNING runs left over from a prior crashed scheduler. Mirrors
 # the ORPHANED-jobs recovery sweep below — both run unconditionally on
 # scheduler start. Idempotent: a second call is a no-op because the first
@@ -761,14 +784,24 @@ COMMIT;")
             fi
             
             if [ -z "$NEXT_SERVICE_ID" ]; then
-                # Natural completion: every active service has a row in this run.
-                # Close it COMPLETED so the next window entry opens a fresh run.
+                # Every active service has a row in this run. Close it COMPLETED
+                # only once nothing is still RUNNING — otherwise a fresh run
+                # would open on the next iteration and re-dispatch the same
+                # services as soon as their old background jobs finished
+                # (the user-visible "RUNNING → WAITING → re-run" bug).
                 if [ -n "$CURRENT_RUN_ID" ]; then
-                    log "All tasks completed for run #$CURRENT_RUN_ID. Closing as COMPLETED."
-                    run_close "$CURRENT_RUN_ID" COMPLETED
-                    CURRENT_RUN_ID=""
+                    if run_can_close_naturally "$CURRENT_RUN_ID"; then
+                        log "All tasks completed for run #$CURRENT_RUN_ID. Closing as COMPLETED."
+                        run_close "$CURRENT_RUN_ID" COMPLETED
+                        CURRENT_RUN_ID=""
+                        log "All tasks completed for today. Waiting..."
+                    else
+                        IN_FLIGHT=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE run_id=$CURRENT_RUN_ID AND status='RUNNING';")
+                        log "All services dispatched in run #$CURRENT_RUN_ID; waiting for ${IN_FLIGHT:-?} in-flight job(s) to finish."
+                    fi
+                else
+                    log "All tasks completed for today. Waiting..."
                 fi
-                log "All tasks completed for today. Waiting..."
             else
                 CONTAINER_NAME=$($DB_QUERY "SELECT container_name FROM services WHERE id=$NEXT_SERVICE_ID;")
 
