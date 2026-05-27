@@ -28,6 +28,7 @@ tmp/
 .ruby-lsp/
 .vscode/
 .idea/
+.antigravitycli/
 
 # graphify knowledge graph (locally regenerable; large viz + cache)
 graphify-out/
