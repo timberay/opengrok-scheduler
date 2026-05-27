@@ -16,13 +16,14 @@ This is a Bash-based helper that organizes batch jobs for more than 70 service b
 - **Process Usage**: It counts how many other programs are running or waiting.
 - **Notebook Management (SQLite3)**: It keeps the list of boxes, rules, and history in a small notebook file.
 - **Cycle-Based History (Runs)**: Each scheduling cycle is recorded as one row in the `runs` table, replacing the previous timestamp-based "last 23 hours" model. A run opens on entry to the working window and closes when:
-  - all active services have a job row in that run (`COMPLETED`),
-  - the working window ends with services still pending (`PARTIAL`),
+  - all active services have a job row in that run AND every job has reached a terminal status (`COMPLETED`),
+  - the working window ends with services still pending (`PARTIAL`) — any in-flight background processes are terminated via `drain_bg_jobs` and their job rows transition to `ORPHANED` with message `'Window closed'`, so no stale `RUNNING` rows linger past the window,
   - the scheduler shuts down or recovers from a crash (`ABORTED`).
   Manual `--service <container>` jobs run outside any cycle (their `run_id` is `NULL`) and are retained per a separate day-based rule. Retention keeps `MAX(RUN_RETENTION_MIN runs, RUN_RETENTION_DAYS days)`.
 - **Background Work**: It can start batch jobs in the background so it can do more than one thing at a time.
 - **Sequential Execution (--sequence)**: If you prefer to run only one task at a time, use the `--sequence` flag to wait for the current job to finish before starting the next one.
 - **Concurrency Cap (MAX_CONCURRENT_JOBS)**: It limits the number of jobs that can run at the same time (default 3). This stops the server from being overloaded when several jobs finish the light "download" stage together and suddenly all start the heavy "indexing" stage. Applies to both the scheduled loop and `--service` manual triggers, and is race-safe across both paths.
+- **Duplicate-Dispatch Protection**: Both admission paths additionally refuse a new dispatch when the target service already has a `RUNNING` job row, even when the cap has slack. So `--service X` while the main loop is already indexing X fails cleanly with a `Service already running` diagnostic (exit 1) instead of spawning a second concurrent indexer against the same target. The same per-service guard is wired into the main-loop INSERT as belt-and-braces for recovery edge cases.
 - **Crash-Safe Recovery (PID + starttime identity)**: Every spawned job records both its PID and the process's `/proc/<pid>/stat` starttime. After a crash or restart, the scheduler verifies the recorded tuple still matches before resuming tracking. If the OS recycled the PID for an unrelated process, the row is marked ORPHANED without sending any signal. Plain PIDs are never trusted for kill or cleanup decisions.
 - **Single-Instance Lock**: The scheduler holds an `flock` on a lock file at startup. A second scheduler launched against the same DB exits immediately, preventing two main loops from racing on job admission.
 - **Graceful Termination (KILL_GRACE_SEC)**: When killing a job tree, SIGTERM goes to the whole process group, then `KILL_GRACE_SEC` seconds (default 10) elapse before SIGKILL. The grace period gives SIGTERM-respecting workloads time to flush state. Identity is re-verified immediately before each signal pass so PID reuse during the wait window cannot redirect the SIGKILL to an unrelated process.
@@ -109,9 +110,21 @@ Run #1 [COMPLETED, trigger=auto] 2026-04-30 00:15:03 ~ 2026-04-30 01:45:03 | 3/3
 ```
 
 ### Recover a Stuck Cycle (--init)
-Close the in-flight run as `ABORTED` and exit. Past runs and their job rows are
-preserved. Use this when a cycle is stuck and you want the next start to open a
-fresh run cleanly:
+Close the in-flight run as `ABORTED` and exit, sweeping any still-`RUNNING`
+job rows in that run to `ORPHANED` (with message `'Aborted by --init'`) so
+`--status` reflects a coherent state immediately, without waiting for the
+next scheduler boot's recovery sweep. Past runs and their job rows are
+preserved.
+
+If the scheduler's main loop is currently running on the same DB, `--init`
+refuses with a non-zero exit and an actionable diagnostic pointing you at
+`kill -TERM <pid>` — the running scheduler's shutdown trap is the only path
+that can safely drain its in-flight background processes (a separate
+`--init` invocation has no IPC into the live BG_PIDS table). Detection
+reads the lock file PID and verifies its `/proc/<pid>/cmdline` matches
+`scheduler`, so stale lock files (dead PID, or PID recycled to an
+unrelated process) fall through to the normal abort path.
+
 ```bash
 ./bin/scheduler.sh --init
 ```
@@ -165,18 +178,24 @@ You can change rules in the `.env` file. The helper reads this file every time i
 Run these games to make sure the helper is working:
 ```bash
 # Resource Monitoring
-./tests/test_monitor.sh             # Check all 10 resource metrics and thresholds
-./tests/test_threshold_boundary.sh  # Check check_thresholds -gt boundary semantics (at LIMIT = safe, LIMIT+1 = breach)
+./tests/test_monitor.sh                 # Check all 10 resource metrics and thresholds
+./tests/test_threshold_boundary.sh      # Check check_thresholds -gt boundary semantics (at LIMIT = safe, LIMIT+1 = breach)
+./tests/test_resource_throttle_release.sh  # Check resource gate blocks dispatch and recovers cleanly (two-phase)
 
 # Scheduler Logic
-./tests/test_scheduler_logic.sh     # Check the time and waiting rules
-./tests/test_async_concurrency.sh   # Check if many boxes can work at the same time
-./tests/test_sequence_mode.sh       # Check if the helper can run boxes one by one
-./tests/test_concurrency_cap.sh     # Check that MAX_CONCURRENT_JOBS caps running jobs in both loop and --service paths
-./tests/test_idle_timeout.sh        # Check if idle jobs (no CPU activity) are detected and stopped
-./tests/test_sigterm_cleanup.sh     # Check if the helper cleans up on shutdown signal
-./tests/test_error_skip.sh          # Check FAILED/TIMEOUT jobs are excluded from next-job retry pool within the current run
-./tests/test_dedup_by_run.sh        # Check auto-cycle dedup is scoped to run_id, replacing the 23h rolling window
+./tests/test_scheduler_logic.sh                  # Check the time and waiting rules
+./tests/test_async_concurrency.sh                # Check if many boxes can work at the same time
+./tests/test_sequence_mode.sh                    # Check if the helper can run boxes one by one
+./tests/test_concurrency_cap.sh                  # Check that MAX_CONCURRENT_JOBS caps running jobs in both loop and --service paths
+./tests/test_cap_slot_release.sh                 # Check cap slot-release granularity (freed slot allows exactly one new dispatch, not zero, not two)
+./tests/test_idle_timeout.sh                     # Check if idle jobs (no CPU activity) are detected and stopped
+./tests/test_sigterm_cleanup.sh                  # Check if the helper cleans up on shutdown signal
+./tests/test_error_skip.sh                       # Check FAILED/TIMEOUT jobs are excluded from next-job retry pool within the current run
+./tests/test_dedup_by_run.sh                     # Check auto-cycle dedup is scoped to run_id, replacing the 23h rolling window
+./tests/test_failed_then_retry_next_cycle.sh     # Check a FAILED row in a closed prior run does not block re-dispatch in the next cycle
+./tests/test_premature_run_close.sh              # Check natural-completion close defers while jobs are still RUNNING (no premature COMPLETED)
+./tests/test_service_added_mid_cycle.sh          # Check a service inserted mid-cycle joins the current run on the next iteration
+./tests/test_service_deactivated_mid_cycle.sh    # Check is_active=0 mid-cycle does not abort in-flight jobs and excludes from next cycle
 
 # Run Lifecycle (cycle-based history)
 ./tests/test_runs_schema.sh             # Check runs table + jobs.run_id migration is idempotent
@@ -188,28 +207,39 @@ Run these games to make sure the helper is working:
 ./tests/test_status_runs.sh             # Check --status reports the latest run summary and counters
 ./tests/test_retention.sh               # Check retention keeps MAX(RUN_RETENTION_MIN, RUN_RETENTION_DAYS)
 ./tests/test_smoke_e2e.sh               # Drive the real bin/scheduler.sh end-to-end (--status / --service / main-loop COMPLETED + PARTIAL on window exit)
+./tests/test_full_daily_cycle.sh        # Check full daily-cycle happy path end-to-end (18-assertion contract)
+./tests/test_window_end_drain.sh        # Check drain_bg_jobs helper terminates tracked jobs and stamps DB
+./tests/test_window_close_during_run.sh # Check window close mid-cycle drains in-flight jobs and marks run PARTIAL
 
 # Command Options
-./tests/test_init_option.sh         # Check the run-abort behavior of --init (and --purge-all wipe path)
-./tests/test_service_option.sh      # Check if running one box right away works
-./tests/test_status_output.sh       # Check the status reports
+./tests/test_init_option.sh                  # Check the run-abort behavior of --init (and --purge-all wipe path)
+./tests/test_init_with_in_flight.sh          # Check --init refuses while a live scheduler is running, sweeps stale RUNNING to ORPHANED when proceeding
+./tests/test_service_option.sh               # Check if running one box right away works
+./tests/test_service_bad_input.sh            # Check --service rejects invalid names, unknown services, and cap/duplicate refusal diagnostics
+./tests/test_service_main_loop_collision.sh  # Check --service refuses duplicate dispatch when main loop already has the service RUNNING
+./tests/test_status_output.sh                # Check the status reports
+./tests/test_status_partial_aborted.sh       # Check --status renders PARTIAL/ABORTED runs and ORPHANED rows coherently
 
 # Database
-./tests/test_db_init.sh             # Check if the helper can make its first notes
-./tests/test_db_stress.sh           # Check if the notebook is safe when many things happen
-./tests/test_db_error_handling.sh   # Check how the helper handles notebook errors
-./tests/test_db_query_fixes.sh      # Check database query edge cases
-./tests/test_migrate_constraint.sh  # Check schema migration with constraints
+./tests/test_db_init.sh                    # Check if the helper can make its first notes
+./tests/test_db_stress.sh                  # Check if the notebook is safe when many things happen
+./tests/test_db_error_handling.sh          # Check how the helper handles notebook errors
+./tests/test_db_query_fixes.sh             # Check database query edge cases
+./tests/test_db_busy_timeout_contention.sh # Check PRAGMA busy_timeout carries contending writers through real lock holds
+./tests/test_migrate_constraint.sh         # Check schema migration with constraints
 
 # Process & Recovery
-./tests/test_orphan_status.sh       # Check if the helper detects jobs after a crash
-./tests/test_orphan_recovery_fix.sh # Check if orphaned jobs are recovered correctly
-./tests/test_kill_validation.sh     # Check kill_process_tree refuses PID 0/1/empty/non-numeric (no system damage)
-./tests/test_instance_lock.sh       # Check that two scheduler instances cannot run on the same DB
-./tests/test_signal_isolation.sh    # Check spawned jobs ignore broadcast SIGTERM so cleanup_and_exit can walk BG_PIDS
-./tests/test_pid_identity.sh        # Check (PID, starttime) identity helpers used to defend against PID reuse
-./tests/test_pid_reuse_defense.sh   # Check recovery and stale-expire skip kills when starttime mismatches
-./tests/test_kill_grace.sh          # Check kill_process_tree starttime re-verification and KILL_GRACE_SEC env var
+./tests/test_orphan_status.sh              # Check if the helper detects jobs after a crash
+./tests/test_orphan_recovery_fix.sh        # Check if orphaned jobs are recovered correctly
+./tests/test_kill_validation.sh            # Check kill_process_tree refuses PID 0/1/empty/non-numeric (no system damage)
+./tests/test_instance_lock.sh              # Check that two scheduler instances cannot run on the same DB
+./tests/test_signal_isolation.sh           # Check spawned jobs ignore broadcast SIGTERM so cleanup_and_exit can walk BG_PIDS
+./tests/test_sigterm_mid_window.sh         # Check SIGTERM and SIGINT mid-window both drain BG_PIDS and close run ABORTED
+./tests/test_sigkill_restart_recovery.sh   # Check recovery after SIGKILL — dead PID → ORPHANED; live reparented child → recovered + reap-before-redispatch (A4 race fix)
+./tests/test_pid_identity.sh               # Check (PID, starttime) identity helpers used to defend against PID reuse
+./tests/test_pid_reuse_defense.sh          # Check recovery and stale-expire skip kills when starttime mismatches
+./tests/test_pid_reuse_cross_restart.sh    # Check recovery + stale-expire never kill an innocent process at a recycled PID
+./tests/test_kill_grace.sh                 # Check kill_process_tree starttime re-verification and KILL_GRACE_SEC env var
 
 # Code Quality
 ./tests/test_input_validation.sh    # Check if the helper rejects bad input (SQL injection etc.)
