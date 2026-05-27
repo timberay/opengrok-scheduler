@@ -968,17 +968,40 @@ COMMIT;")
                         log "[Reap] BG_PID for $CONTAINER_NAME (PID=${BG_PIDS[$CONTAINER_NAME]}) is dead but unreaped; reaping before re-dispatch."
                         reap_bg_processes
                     else
-                        # 7. Execute Job — atomic INSERT-if-under-cap guards race with manual trigger (bin/scheduler.sh:180).
-                        # The NOT EXISTS clause mirrors the per-service guard
-                        # in the --service path: within a single run, the
-                        # NEXT_SERVICE_ID query already excludes services
-                        # that have any row in this run, so this guard is
-                        # belt-and-braces for recovery edge cases where
-                        # BG_PIDS lost track of a service whose old RUNNING
-                        # row was not yet finalised (or for a future caller
-                        # that triggers main-loop dispatch outside the
-                        # NEXT_SERVICE_ID dedup path).
-                        JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
+                        # Per-service crash-safe flock. The lock is acquired
+                        # here and the FD is INHERITED by the spawned
+                        # subshell at fork time; the scheduler closes its
+                        # own FD after spawn so the lock survives only as
+                        # long as the subshell. If THIS scheduler later
+                        # crashes between INSERT and the pid UPDATE, the
+                        # orphaned subshell (reparented to init) keeps the
+                        # FD open and the lock held until it exits on its
+                        # own. A new scheduler's dispatch for the same
+                        # service finds the lock taken and skips here,
+                        # so two indexing tasks against the same target
+                        # cannot run concurrently — closing the "INSERT
+                        # commits but pid UPDATE never lands" race window
+                        # that the per-service NOT EXISTS DB guard alone
+                        # cannot cover (the orphan row gets swept to
+                        # ORPHANED by recovery, so the NOT EXISTS check
+                        # would pass on the next cycle).
+                        SVC_LOCK_FILE="${DB_PATH}.svc.${CONTAINER_NAME}.lock"
+                        exec {svc_lock_fd}>>"$SVC_LOCK_FILE"
+                        if ! flock -n -x "$svc_lock_fd" 2>/dev/null; then
+                            log "Process check skip: external svc-lock held for $CONTAINER_NAME (orphan subshell from prior crash?). Skipping..."
+                            exec {svc_lock_fd}>&-
+                        else
+                            # 7. Execute Job — atomic INSERT-if-under-cap guards race with manual trigger (bin/scheduler.sh:180).
+                            # The NOT EXISTS clause mirrors the per-service guard
+                            # in the --service path: within a single run, the
+                            # NEXT_SERVICE_ID query already excludes services
+                            # that have any row in this run, so this guard is
+                            # belt-and-braces for recovery edge cases where
+                            # BG_PIDS lost track of a service whose old RUNNING
+                            # row was not yet finalised (or for a future caller
+                            # that triggers main-loop dispatch outside the
+                            # NEXT_SERVICE_ID dedup path).
+                            JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
 INSERT INTO jobs (service_id, run_id, status, start_time) \
 SELECT $NEXT_SERVICE_ID, $CURRENT_RUN_ID, 'RUNNING', datetime('now', 'localtime') \
 WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MAX_CONCURRENT \
@@ -986,36 +1009,45 @@ WHERE (SELECT COUNT(*) FROM jobs WHERE status='RUNNING') < $MAX_CONCURRENT \
 SELECT CASE WHEN changes() > 0 THEN last_insert_rowid() ELSE 0 END; \
 COMMIT;")
 
-                        if [ $? -ne 0 ] || [ -z "$JOB_ID" ]; then
-                            log "[Error] Failed to create job record in database for $CONTAINER_NAME. Skipping..."
-                        elif [ "$JOB_ID" = "0" ]; then
-                            log "Concurrency cap race: slot filled by concurrent path. '$CONTAINER_NAME' is waiting..."
-                        else
-                            # Wrap the spawn in a subshell that ignores SIGTERM/SIGINT.
-                            # Under systemd KillMode=control-group or a tty Ctrl+C, every
-                            # process in the unit/PG receives the signal simultaneously.
-                            # Without this trap the subshell would exit before
-                            # cleanup_and_exit could walk BG_PIDS and kill each tree, and
-                            # the wrapped `timeout` child would be reparented to init and
-                            # keep running. The trap blocks the broadcast SIGTERM, giving
-                            # cleanup_and_exit time to issue explicit kill_process_tree
-                            # calls; the SIGKILL fallback in kill_process_tree still works
-                            # because SIGKILL cannot be trapped.
-                            ( trap '' SIGTERM SIGINT; run_indexing_task "$CONTAINER_NAME" ) &
-                            PID=$!
-                            # Capture starttime alongside PID. PID alone is ambiguous
-                            # because the kernel recycles PID numbers, so identity
-                            # checks during recovery / stale-expire compare against
-                            # the (PID, starttime) tuple to avoid SIGKILLing an
-                            # unrelated process that happens to occupy the same PID.
-                            PID_STARTTIME=$(get_pid_starttime "$PID")
-                            BG_PIDS["$CONTAINER_NAME"]=$PID
-                            BG_PREV_STATE["$CONTAINER_NAME"]="RUNNING"
-                            # Update DB with PID + starttime for crash-safe recovery
-                            $DB_QUERY "UPDATE jobs SET pid=$PID, pid_starttime=${PID_STARTTIME:-NULL}, process_state='RUNNING' WHERE id=$JOB_ID;"
-                            log "Background PID=$PID started for $CONTAINER_NAME (Job ID: $JOB_ID)"
-                            BG_LAST_CPU["$CONTAINER_NAME"]=""
-                            BG_IDLE_SINCE["$CONTAINER_NAME"]=0
+                            if [ $? -ne 0 ] || [ -z "$JOB_ID" ]; then
+                                log "[Error] Failed to create job record in database for $CONTAINER_NAME. Skipping..."
+                                exec {svc_lock_fd}>&-
+                            elif [ "$JOB_ID" = "0" ]; then
+                                log "Concurrency cap race: slot filled by concurrent path. '$CONTAINER_NAME' is waiting..."
+                                exec {svc_lock_fd}>&-
+                            else
+                                # Wrap the spawn in a subshell that ignores SIGTERM/SIGINT.
+                                # Under systemd KillMode=control-group or a tty Ctrl+C, every
+                                # process in the unit/PG receives the signal simultaneously.
+                                # Without this trap the subshell would exit before
+                                # cleanup_and_exit could walk BG_PIDS and kill each tree, and
+                                # the wrapped `timeout` child would be reparented to init and
+                                # keep running. The trap blocks the broadcast SIGTERM, giving
+                                # cleanup_and_exit time to issue explicit kill_process_tree
+                                # calls; the SIGKILL fallback in kill_process_tree still works
+                                # because SIGKILL cannot be trapped.
+                                # The subshell inherits svc_lock_fd at fork time and keeps
+                                # the lock alive across any scheduler-side crash.
+                                ( trap '' SIGTERM SIGINT; run_indexing_task "$CONTAINER_NAME" ) &
+                                PID=$!
+                                # Capture starttime alongside PID. PID alone is ambiguous
+                                # because the kernel recycles PID numbers, so identity
+                                # checks during recovery / stale-expire compare against
+                                # the (PID, starttime) tuple to avoid SIGKILLing an
+                                # unrelated process that happens to occupy the same PID.
+                                PID_STARTTIME=$(get_pid_starttime "$PID")
+                                BG_PIDS["$CONTAINER_NAME"]=$PID
+                                BG_PREV_STATE["$CONTAINER_NAME"]="RUNNING"
+                                # Update DB with PID + starttime for crash-safe recovery
+                                $DB_QUERY "UPDATE jobs SET pid=$PID, pid_starttime=${PID_STARTTIME:-NULL}, process_state='RUNNING' WHERE id=$JOB_ID;"
+                                log "Background PID=$PID started for $CONTAINER_NAME (Job ID: $JOB_ID)"
+                                BG_LAST_CPU["$CONTAINER_NAME"]=""
+                                BG_IDLE_SINCE["$CONTAINER_NAME"]=0
+                                # Close the scheduler-side FD; the subshell
+                                # inherited its own copy at fork time and now
+                                # owns the lock for the lifetime of the job.
+                                exec {svc_lock_fd}>&-
+                            fi
                         fi
                     fi
                 fi
