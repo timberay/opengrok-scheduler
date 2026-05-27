@@ -867,6 +867,27 @@ COMMIT;")
                         log "Process check skip: Sequence mode is enabled and ${#BG_PIDS[@]} job(s) already running."
                     elif [[ -n "${BG_PIDS[$CONTAINER_NAME]}" ]] && kill -0 "${BG_PIDS[$CONTAINER_NAME]}" 2>/dev/null; then
                         log "Process check skip: $CONTAINER_NAME is already being indexed. Skipping..."
+                    elif [[ -n "${BG_PIDS[$CONTAINER_NAME]}" ]]; then
+                        # BG_PIDS still holds an entry but `kill -0` says the
+                        # PID is gone. This is the reap/dispatch race window:
+                        # the tracked PID died between the top-of-loop
+                        # reap_bg_processes call and this check (the gap is
+                        # the resource-sampling phase, which can take several
+                        # seconds via vmstat/iostat). Without intervention,
+                        # we would dispatch a new background job that
+                        # overwrites BG_PIDS[$CONTAINER_NAME] before reap
+                        # ever observed the old PID as EXITED — leaving the
+                        # old job DB row permanently RUNNING (until 2x
+                        # JOB_TIMEOUT_SEC stale-expire).
+                        # Force one more reap pass now: get_process_state
+                        # will return EXITED for the dead PID, and reap will
+                        # finalise the old job row, clear BG_PIDS. We defer
+                        # the new dispatch to the next iteration so the
+                        # reap's DB commit is durable and CURRENT_RUNNING is
+                        # re-sampled cleanly. (Falls through to the natural
+                        # sleep $INTERVAL at the bottom of the main loop.)
+                        log "[Reap] BG_PID for $CONTAINER_NAME (PID=${BG_PIDS[$CONTAINER_NAME]}) is dead but unreaped; reaping before re-dispatch."
+                        reap_bg_processes
                     else
                         # 7. Execute Job — atomic INSERT-if-under-cap guards race with manual trigger (bin/scheduler.sh:180)
                         JOB_ID=$($DB_QUERY "BEGIN IMMEDIATE; \
