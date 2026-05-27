@@ -19,7 +19,12 @@ $DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('s
 $DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('svc2', 1, 1);"
 $DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('svc3', 1, 1);"
 
-# 3. Run scheduler in background with short interval and high threshold
+# 3. Run scheduler in background with short interval and high threshold.
+# Force the scheduling window open so the test does not silently no-op
+# when run outside the default 18:00~06:00 window — this test exercises
+# dispatch behavior, not time-gating.
+export START_TIME=00:00
+export END_TIME=23:59
 export CHECK_INTERVAL=1
 export RESOURCE_THRESHOLD=100
 timeout 30s "$SCHEDULER" &

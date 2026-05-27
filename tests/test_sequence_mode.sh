@@ -19,7 +19,11 @@ $DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('s
 $DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('seq2', 1, 1);"
 $DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('seq3', 1, 1);"
 
-# 3. Run scheduler in background with --sequence, short interval, high threshold
+# 3. Run scheduler in background with --sequence, short interval, high threshold.
+# Force the scheduling window open so dispatch happens regardless of wall-clock —
+# this test exercises sequential admission, not time-gating.
+export START_TIME=00:00
+export END_TIME=23:59
 export CHECK_INTERVAL=1
 export RESOURCE_THRESHOLD=100
 timeout 20s "$SCHEDULER" --sequence &

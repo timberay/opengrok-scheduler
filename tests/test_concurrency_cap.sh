@@ -22,6 +22,11 @@ for i in 1 2 3 4 5 6; do
     $DB_QUERY "INSERT INTO services (container_name, priority, is_active) VALUES ('capsvc${i}', 1, 1);"
 done
 
+# Force the scheduling window open so dispatch happens regardless of the
+# wall-clock when the test runs. This test exercises the concurrency cap,
+# not the time-gating behavior.
+export START_TIME=00:00
+export END_TIME=23:59
 export CHECK_INTERVAL=1
 export RESOURCE_THRESHOLD=100
 export MAX_CONCURRENT_JOBS=2

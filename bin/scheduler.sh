@@ -170,6 +170,47 @@ run_recover_stale() {
     fi
 }
 
+# Drain every PID tracked in BG_PIDS: terminate its process tree and
+# transition the matching DB job row to a terminal status. Shared by the
+# SIGTERM/SIGINT shutdown trap and the end-of-window transition so neither
+# path leaves RUNNING DB rows (which would otherwise linger until 2×
+# JOB_TIMEOUT_SEC) or live background processes consuming off-hours
+# resources. Reads BG_PIDS / BG_PREV_STATE / BG_LAST_CPU / BG_IDLE_SINCE
+# from the caller's scope via bash dynamic scoping — callers in the main
+# loop have them declared; tests can declare local arrays of the same
+# names and exercise this function in isolation.
+# Args: $1 = terminal status (ORPHANED|FAILED|TIMEOUT). Default ORPHANED.
+#       $2 = human-readable message stored on the job row. Default 'Drained'.
+drain_bg_jobs() {
+    local STATUS="${1:-ORPHANED}"
+    local MSG="${2:-Drained}"
+    case "$STATUS" in
+        ORPHANED|FAILED|TIMEOUT) ;;
+        *) log "[Error] drain_bg_jobs: invalid status '$STATUS' (must be ORPHANED|FAILED|TIMEOUT)"; return 1 ;;
+    esac
+    # Reject SQL-meta in the message to keep this safe even if a future
+    # caller passes operator-supplied text — the value is inlined into the
+    # UPDATE statement.
+    if [[ "$MSG" == *\'* ]]; then
+        log "[Error] drain_bg_jobs: message must not contain single quotes"
+        return 1
+    fi
+    local CNAME PID
+    for CNAME in "${!BG_PIDS[@]}"; do
+        PID=${BG_PIDS[$CNAME]}
+        log "Draining $CNAME (PID=$PID): $MSG"
+        kill_process_tree "$PID"
+        $DB_QUERY "UPDATE jobs SET status='$STATUS', process_state='EXITED',
+                   end_time=datetime('now', 'localtime'),
+                   duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER),
+                   message='$MSG' WHERE pid=$PID AND status='RUNNING';"
+        unset BG_PIDS["$CNAME"]
+        unset BG_PREV_STATE["$CNAME"]
+        unset BG_LAST_CPU["$CNAME"]
+        unset BG_IDLE_SINCE["$CNAME"]
+    done
+}
+
 # Daily retention sweep — keeps MAX(RUN_RETENTION_MIN runs, RUN_RETENTION_DAYS days)
 # of finished runs and their jobs. RUNNING runs are never touched. Manual jobs
 # (run_id IS NULL) follow MANUAL_JOB_RETENTION_DAYS independently. Idempotent.
@@ -487,15 +528,7 @@ COMMIT;")
     # Graceful shutdown handler
     cleanup_and_exit() {
         log "Received shutdown signal. Cleaning up..."
-        for CNAME in "${!BG_PIDS[@]}"; do
-            local PID=${BG_PIDS[$CNAME]}
-            log "Terminating $CNAME (PID=$PID)..."
-            kill_process_tree "$PID"
-            $DB_QUERY "UPDATE jobs SET status='ORPHANED', process_state='EXITED',
-                       end_time=datetime('now', 'localtime'),
-                       duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER),
-                       message='Scheduler shutdown' WHERE pid=$PID AND status='RUNNING';"
-        done
+        drain_bg_jobs ORPHANED "Scheduler shutdown"
         # Close the in-flight run (if any) so a future scheduler restart
         # does not see a stale RUNNING row and refuse to open a fresh run
         # on the next window entry. Read from DB (not $CURRENT_RUN_ID)
@@ -738,14 +771,19 @@ COMMIT;")
         # 2. Check Time Range — also tracks run lifecycle transitions.
         if ! check_time_range "$START" "$END" > /dev/null; then
             # If we just exited the window with an open run that still has
-            # incomplete services, mark it PARTIAL. (Natural-completion close
-            # below would have already moved status off RUNNING.)
+            # incomplete services, drain in-flight background jobs (so no
+            # RUNNING DB rows or off-hours processes linger) and then mark
+            # the run PARTIAL.
             #
             # Read from DB via run_current_id rather than the in-memory
             # $CURRENT_RUN_ID — this path must survive a scheduler restart
             # mid-night without leaking a stale RUNNING row.
             OPEN_RUN=$(run_current_id)
             if [ -n "$OPEN_RUN" ]; then
+                if [ ${#BG_PIDS[@]} -gt 0 ]; then
+                    log "Window closed with ${#BG_PIDS[@]} in-flight job(s) in run #$OPEN_RUN — draining."
+                    drain_bg_jobs ORPHANED "Window closed"
+                fi
                 log "Window closed with run #$OPEN_RUN still open — marking PARTIAL."
                 run_close "$OPEN_RUN" PARTIAL
                 CURRENT_RUN_ID=""
