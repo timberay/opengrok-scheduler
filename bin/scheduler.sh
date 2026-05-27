@@ -390,50 +390,46 @@ if [[ "$1" != "--no-run" ]]; then
         exit 0
     fi
 
+    # Refuse the current CLI command if a live scheduler instance is detected
+    # via the per-DB lock file's PID + /proc cmdline check. Used by --init
+    # and --purge-all to prevent the operator from racing the main loop:
+    # both commands run in a SEPARATE process and intentionally do NOT
+    # acquire the advisory flock (the lock is held by the main loop for its
+    # entire lifetime). If the main loop is active, mutating the DB from
+    # here would NOT stop the loop's background children — they'd keep
+    # churning, get reaped into a now-stale run, and the loop's next
+    # iteration would open a fresh run and may re-dispatch services whose
+    # old jobs are still in flight.
+    #
+    # Conservative on purpose — false-positive refusal is worse than false
+    # negative, so we only refuse when the PID is alive AND its
+    # /proc/<pid>/cmdline contains 'scheduler'. Stale lock files (dead PID,
+    # or PID recycled to an unrelated process) fall through to the normal
+    # command path.
+    # Args: $1 = command name (e.g., "--init") for the diagnostic.
+    # Exits 1 with diagnostic if live scheduler detected; returns 0 otherwise.
+    refuse_if_live_scheduler() {
+        local CMD="$1"
+        local LOCK_FILE="${DB_PATH}.lock"
+        [ -s "$LOCK_FILE" ] || return 0
+        local LIVE_PID
+        LIVE_PID=$(head -1 "$LOCK_FILE" 2>/dev/null)
+        [[ "$LIVE_PID" =~ ^[0-9]+$ ]] && [ "$LIVE_PID" -gt 1 ] && kill -0 "$LIVE_PID" 2>/dev/null || return 0
+        local CMDLINE=""
+        [ -r "/proc/$LIVE_PID/cmdline" ] && CMDLINE=$(tr '\0' ' ' < "/proc/$LIVE_PID/cmdline" 2>/dev/null)
+        echo "$CMDLINE" | grep -qi "scheduler" || return 0
+        echo "[Error] $CMD refused: a scheduler instance is running (PID=$LIVE_PID, lock=$LOCK_FILE)." >&2
+        echo "[Error] Send SIGTERM to that PID first — its shutdown trap drains in-flight jobs and closes the open run cleanly." >&2
+        echo "[Error]   kill -TERM $LIVE_PID" >&2
+        exit 1
+    }
+
     # Handle --init argument — non-destructive: closes current run only.
-    #
-    # SAFETY: --init runs in a SEPARATE process from the main scheduler loop
-    # and intentionally does NOT acquire the advisory flock (the lock is
-    # held by the main loop for its entire lifetime). If the main loop is
-    # active, simply flipping the run to ABORTED here would NOT stop the
-    # loop's background children — they'd keep churning, get reaped into
-    # the now-ABORTED run, and the loop's next iteration would open a
-    # fresh run and may re-dispatch services whose old jobs are still in
-    # flight.
-    #
-    # Detection: read the PID from the per-DB lock file and verify it is
-    # alive AND its /proc cmdline contains 'scheduler' (best-effort match
-    # for scheduler.sh and any *scheduler*_test wrapper). Conservative on
-    # purpose — false-positive refusal is worse than false-negative.
-    #
-    # If a live scheduler is detected, REFUSE with a diagnostic pointing
-    # the operator at SIGTERM (whose cleanup_and_exit trap drains BG_PIDS
-    # and closes the run properly). Otherwise proceed: close the open run
-    # and also mark its stale RUNNING jobs as ORPHANED so `--status`
-    # immediately reflects a coherent picture (instead of waiting for the
-    # next scheduler boot's recovery sweep).
+    # When proceeding, also marks the open run's still-RUNNING jobs as
+    # ORPHANED so `--status` immediately reflects a coherent picture
+    # (instead of waiting for the next scheduler boot's recovery sweep).
     if [[ "$1" == "--init" ]]; then
-        LOCK_FILE="${DB_PATH}.lock"
-        if [ -s "$LOCK_FILE" ]; then
-            LIVE_PID=$(head -1 "$LOCK_FILE" 2>/dev/null)
-            if [[ "$LIVE_PID" =~ ^[0-9]+$ ]] && [ "$LIVE_PID" -gt 1 ] && kill -0 "$LIVE_PID" 2>/dev/null; then
-                # Verify the PID actually belongs to a scheduler process.
-                # /proc/<pid>/cmdline is NUL-separated; grep -a handles that.
-                CMDLINE=""
-                if [ -r "/proc/$LIVE_PID/cmdline" ]; then
-                    CMDLINE=$(tr '\0' ' ' < "/proc/$LIVE_PID/cmdline" 2>/dev/null)
-                fi
-                if echo "$CMDLINE" | grep -qi "scheduler"; then
-                    echo "[Error] --init refused: a scheduler instance is running (PID=$LIVE_PID, lock=$LOCK_FILE)." >&2
-                    echo "[Error] Send SIGTERM to that PID first — its shutdown trap drains in-flight jobs and closes the open run cleanly." >&2
-                    echo "[Error]   kill -TERM $LIVE_PID" >&2
-                    exit 1
-                fi
-                # PID alive but not a scheduler — treat as stale lock litter
-                # (some other process happens to occupy a recycled PID).
-            fi
-            # PID dead, missing, or not a scheduler — fall through (stale lock).
-        fi
+        refuse_if_live_scheduler "--init"
 
         log "Aborting in-flight run (if any). History preserved."
         OPEN_RUN=$($DB_QUERY "SELECT id FROM runs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1;")
@@ -465,7 +461,13 @@ if [[ "$1" != "--no-run" ]]; then
 
     # Handle --purge-all argument — total wipe (was the old --init behavior).
     # Use this only when you genuinely want to discard ALL history.
+    # Refuses while a live scheduler is running on the same DB: wiping the
+    # tables out from under an active main loop would let it open a fresh
+    # run on the next iteration and re-dispatch every service (the per-
+    # service NOT EXISTS guard at INSERT time can't help — the rows it
+    # checks are precisely what we just deleted). Same detection as --init.
     if [[ "$1" == "--purge-all" ]]; then
+        refuse_if_live_scheduler "--purge-all"
         log "[Warning] --purge-all: deleting ALL jobs and runs. This cannot be undone."
         $DB_QUERY "DELETE FROM jobs; DELETE FROM runs;"
         log "All jobs and runs cleared. Services table preserved (configuration is not history)."

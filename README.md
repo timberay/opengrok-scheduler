@@ -132,7 +132,16 @@ unrelated process) fall through to the normal abort path.
 ### Wipe All History (--purge-all)
 Total wipe of all runs and jobs (services config preserved). Use this only when
 you genuinely want to discard all history. The previous destructive `--init`
-behavior was renamed to this flag in v1.1:
+behavior was renamed to this flag in v1.1.
+
+Like `--init`, `--purge-all` refuses if a live scheduler is running on the
+same DB (lock file PID + `/proc/<pid>/cmdline` check) — wiping the tables
+out from under an active main loop would let it open a fresh run on the
+next iteration and re-dispatch every service, since the per-service
+NOT EXISTS guard at INSERT time can't help when the rows it checks are
+exactly what was just deleted. Stop the live instance first
+(`kill -TERM <pid>`) and then run `--purge-all`.
+
 ```bash
 ./bin/scheduler.sh --purge-all
 ```
@@ -214,6 +223,7 @@ Run these games to make sure the helper is working:
 # Command Options
 ./tests/test_init_option.sh                  # Check the run-abort behavior of --init (and --purge-all wipe path)
 ./tests/test_init_with_in_flight.sh          # Check --init refuses while a live scheduler is running, sweeps stale RUNNING to ORPHANED when proceeding
+./tests/test_purge_with_in_flight.sh         # Check --purge-all refuses while a live scheduler is running (same detection as --init), proceeds past stale lock files
 ./tests/test_service_option.sh               # Check if running one box right away works
 ./tests/test_service_bad_input.sh            # Check --service rejects invalid names, unknown services, and cap/duplicate refusal diagnostics
 ./tests/test_service_main_loop_collision.sh  # Check --service refuses duplicate dispatch when main loop already has the service RUNNING
