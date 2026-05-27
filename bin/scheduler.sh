@@ -391,14 +391,69 @@ if [[ "$1" != "--no-run" ]]; then
     fi
 
     # Handle --init argument — non-destructive: closes current run only.
+    #
+    # SAFETY: --init runs in a SEPARATE process from the main scheduler loop
+    # and intentionally does NOT acquire the advisory flock (the lock is
+    # held by the main loop for its entire lifetime). If the main loop is
+    # active, simply flipping the run to ABORTED here would NOT stop the
+    # loop's background children — they'd keep churning, get reaped into
+    # the now-ABORTED run, and the loop's next iteration would open a
+    # fresh run and may re-dispatch services whose old jobs are still in
+    # flight.
+    #
+    # Detection: read the PID from the per-DB lock file and verify it is
+    # alive AND its /proc cmdline contains 'scheduler' (best-effort match
+    # for scheduler.sh and any *scheduler*_test wrapper). Conservative on
+    # purpose — false-positive refusal is worse than false-negative.
+    #
+    # If a live scheduler is detected, REFUSE with a diagnostic pointing
+    # the operator at SIGTERM (whose cleanup_and_exit trap drains BG_PIDS
+    # and closes the run properly). Otherwise proceed: close the open run
+    # and also mark its stale RUNNING jobs as ORPHANED so `--status`
+    # immediately reflects a coherent picture (instead of waiting for the
+    # next scheduler boot's recovery sweep).
     if [[ "$1" == "--init" ]]; then
+        LOCK_FILE="${DB_PATH}.lock"
+        if [ -s "$LOCK_FILE" ]; then
+            LIVE_PID=$(head -1 "$LOCK_FILE" 2>/dev/null)
+            if [[ "$LIVE_PID" =~ ^[0-9]+$ ]] && [ "$LIVE_PID" -gt 1 ] && kill -0 "$LIVE_PID" 2>/dev/null; then
+                # Verify the PID actually belongs to a scheduler process.
+                # /proc/<pid>/cmdline is NUL-separated; grep -a handles that.
+                CMDLINE=""
+                if [ -r "/proc/$LIVE_PID/cmdline" ]; then
+                    CMDLINE=$(tr '\0' ' ' < "/proc/$LIVE_PID/cmdline" 2>/dev/null)
+                fi
+                if echo "$CMDLINE" | grep -qi "scheduler"; then
+                    echo "[Error] --init refused: a scheduler instance is running (PID=$LIVE_PID, lock=$LOCK_FILE)." >&2
+                    echo "[Error] Send SIGTERM to that PID first — its shutdown trap drains in-flight jobs and closes the open run cleanly." >&2
+                    echo "[Error]   kill -TERM $LIVE_PID" >&2
+                    exit 1
+                fi
+                # PID alive but not a scheduler — treat as stale lock litter
+                # (some other process happens to occupy a recycled PID).
+            fi
+            # PID dead, missing, or not a scheduler — fall through (stale lock).
+        fi
+
         log "Aborting in-flight run (if any). History preserved."
         OPEN_RUN=$($DB_QUERY "SELECT id FROM runs WHERE status='RUNNING' ORDER BY id DESC LIMIT 1;")
         if [ -n "$OPEN_RUN" ]; then
             RUNNING_JOBS=$($DB_QUERY "SELECT count(*) FROM jobs WHERE run_id=$OPEN_RUN AND status='RUNNING';")
             if [ "$RUNNING_JOBS" -gt 0 ]; then
                 log "[Warning] $RUNNING_JOBS jobs in run #$OPEN_RUN are still RUNNING in the DB."
-                log "Marking the run ABORTED. Live processes (if any) will be reaped on next scheduler start."
+                log "Marking them ORPHANED so --status reflects a coherent state immediately."
+                # Mark stale RUNNING rows ORPHANED. No kill is issued from
+                # --init: we have already verified no live scheduler is
+                # tracking these PIDs (lock check above), and blindly
+                # signalling recorded PIDs from a separate process risks
+                # killing recycled-PID workloads. The next scheduler boot's
+                # recovery sweep will reconcile any genuinely live PIDs via
+                # (PID, starttime) identity verification.
+                $DB_QUERY "UPDATE jobs SET status='ORPHANED', process_state='UNKNOWN',
+                           end_time=datetime('now','localtime'),
+                           duration=CAST((julianday('now', 'localtime') - julianday(start_time)) * 86400 AS INTEGER),
+                           message='Aborted by --init'
+                           WHERE run_id=$OPEN_RUN AND status='RUNNING';"
             fi
             $DB_QUERY "UPDATE runs SET status='ABORTED', ended_at=datetime('now','localtime') WHERE id=$OPEN_RUN;"
             log "Run #$OPEN_RUN marked ABORTED."
