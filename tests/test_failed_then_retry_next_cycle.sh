@@ -4,10 +4,11 @@
 #
 # Operator scenario:
 #   svc-flaky fails (non-zero exit) in run #1. Operator does NOTHING — no
-#   manual --service intervention, no service edit. Run #1 closes (COMPLETED
-#   if every service has a terminal row, PARTIAL otherwise). When the next
-#   window opens run #2, svc-flaky must be eligible again, get dispatched,
-#   and (assuming the failure was transient) reach COMPLETED.
+#   manual --service intervention, no service edit. Run #1 closes COMPLETED
+#   (every active service has a terminal row). While still inside the window,
+#   the scheduler opens run #2 to RETRY the still-pending svc-flaky — but it
+#   must NOT re-run svc-good, which already succeeded this session (per-service
+#   once-per-session success gate). svc-flaky reaches COMPLETED on retry.
 #
 # Pinned contract:
 #   1. Run #1 has a row for svc-flaky with status='FAILED' and a non-null
@@ -19,12 +20,14 @@
 #      terminal row; otherwise PARTIAL would close it on window exit). For
 #      this test we seed both svc-good=COMPLETED and svc-flaky=FAILED so
 #      the natural-close path applies.
-#   4. Run #2 opens cleanly on the next loop iteration (window is wide open).
-#   5. svc-flaky gets a fresh row in run #2 and reaches COMPLETED — the
-#      dummy run_indexing_task is `sleep 2` which exits 0, so a transient
-#      failure recovers naturally.
-#   6. Per-run counters: run #2's failed_count is 0 (it does NOT inherit
-#      run #1's failure), and completed_count is 2.
+#   4. Run #2 opens cleanly on the next loop iteration (window is wide open)
+#      because svc-flaky is still pending for this session.
+#   5. Run #2 dispatches ONLY svc-flaky and it reaches COMPLETED — the dummy
+#      run_indexing_task is `sleep 2` which exits 0. svc-good already COMPLETED
+#      this session and must NOT get a row in run #2 (the per-service success
+#      gate keeps successful services from re-running the same night).
+#   6. Per-run counters: run #2's failed_count is 0 and completed_count is 1
+#      (svc-flaky only); run #2 has exactly one job row.
 #   7. Operator-visible: --status during run #2 shows svc-flaky as COMPLETED
 #      in the latest-run table (not as the stale FAILED from run #1).
 #
@@ -168,10 +171,10 @@ R1_FAILED=$($DB_QUERY "SELECT failed_count FROM runs WHERE id=$R1;")
 assert_eq "C3-3: run #1 failed_count=1 (svc-flaky)" "1" "$R1_FAILED"
 
 # ---------------------------------------------------------------------------
-# Now launch the real scheduler. With window 00:00-23:59 it will immediately
-# open run #2, dispatch both services (per-run dedup is per-run so neither
-# is excluded by their run #1 rows), and the dummy sleep-2 task completes
-# both successfully.
+# Now launch the real scheduler. With window 00:00-23:59 it opens run #2 to
+# retry the still-pending svc-flaky. svc-good already COMPLETED this session,
+# so the per-service success gate excludes it — only svc-flaky is dispatched,
+# and the dummy sleep-2 task completes it successfully.
 # ---------------------------------------------------------------------------
 export START_TIME="00:00"
 export END_TIME="23:59"
@@ -219,34 +222,33 @@ else
     fail "C3-5b: svc-flaky did not reach COMPLETED in run #$R2"
 fi
 
-# svc-good must also complete in run #2 (sanity: scheduler isn't stuck).
-if poll_db "SELECT status FROM jobs WHERE service_id=$GOOD_ID AND run_id=$R2;" "COMPLETED" 25 "svc-good reaches COMPLETED in run #$R2"; then
-    pass "C3-5c: svc-good reached COMPLETED in run #$R2 (control)"
-else
-    fail "C3-5c: svc-good did not reach COMPLETED in run #$R2"
-fi
+# svc-good already succeeded in run #1, so the per-service success gate must
+# keep it OUT of run #2 — it must NOT be re-run the same session.
+GOOD_IN_R2=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE service_id=$GOOD_ID AND run_id=$R2;")
+assert_eq "C3-5c: svc-good NOT re-dispatched in run #$R2 (already COMPLETED this session)" "0" "$GOOD_IN_R2"
 
-# Run #2 closes COMPLETED once both services have terminal rows.
+# Run #2 closes COMPLETED once svc-flaky (its only dispatched service) is done.
 if poll_db "SELECT status FROM runs WHERE id=$R2;" "COMPLETED" 15 "run #$R2 closes COMPLETED"; then
     pass "C3-5d: run #$R2 closed COMPLETED"
 else
     fail "C3-5d: run #$R2 did not close COMPLETED in time"
 fi
 
-# Contract 6: run #2's per-run counters are clean — failed_count=0 (run #1's
-# failure is not inherited), completed_count=2.
+# Contract 6: run #2's per-run counters reflect the retry-only scope —
+# failed_count=0 (run #1's failure is not inherited), completed_count=1
+# (svc-flaky only; svc-good was not re-run).
 R2_FAILED=$($DB_QUERY "SELECT failed_count FROM runs WHERE id=$R2;")
 assert_eq "C3-6: run #2 failed_count=0 (does NOT count run #1's failure)" "0" "$R2_FAILED"
 
 R2_COMPLETED=$($DB_QUERY "SELECT completed_count FROM runs WHERE id=$R2;")
-assert_eq "C3-6: run #2 completed_count=2 (both services recovered)" "2" "$R2_COMPLETED"
+assert_eq "C3-6: run #2 completed_count=1 (only svc-flaky retried)" "1" "$R2_COMPLETED"
 
-# Per-run sanity: exactly one row per service in run #2.
+# Per-run sanity: exactly one row in run #2 (svc-flaky retry only).
 R2_JOBS=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE run_id=$R2;")
-assert_eq "C3-6: run #2 has exactly 2 job rows (one per service)" "2" "$R2_JOBS"
+assert_eq "C3-6: run #2 has exactly 1 job row (svc-flaky retry)" "1" "$R2_JOBS"
 
 R2_DISTINCT=$($DB_QUERY "SELECT COUNT(DISTINCT service_id) FROM jobs WHERE run_id=$R2;")
-assert_eq "C3-6: run #2 has 2 distinct services" "2" "$R2_DISTINCT"
+assert_eq "C3-6: run #2 has 1 distinct service (svc-flaky)" "1" "$R2_DISTINCT"
 
 # Contract 7: --status surfaces the recovered state. The latest-run table
 # scopes the per-service rows to run #2 (the most recent run), so svc-flaky

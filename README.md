@@ -20,6 +20,7 @@ This is a Bash-based helper that organizes batch jobs for more than 70 service b
   - the working window ends with services still pending (`PARTIAL`) — any in-flight background processes are terminated via `drain_bg_jobs` and their job rows transition to `ORPHANED` with message `'Window closed'`, so no stale `RUNNING` rows linger past the window,
   - the scheduler shuts down or recovers from a crash (`ABORTED`).
   Manual `--service <container>` jobs run outside any cycle (their `run_id` is `NULL`) and are retained per a separate day-based rule. Retention keeps `MAX(RUN_RETENTION_MIN runs, RUN_RETENTION_DAYS days)`.
+- **Run-Once-Per-Service-Per-Session**: Each active service is indexed at most **once per working-window session**. The scheduler keys this decision off job history: a service that already reached `COMPLETED` since the window opened is excluded from further dispatch until the **next** window (e.g. the next night), so a finished service is never re-run the same day. A service that `FAILED` (or never finished) stays eligible and is **retried** in a follow-on run while the window is still open. When every active service has succeeded for the session, the loop goes idle until the next window instead of opening a fresh run. The session boundary is the most recent `START_TIME`; for a cross-midnight window (e.g. `18:00`→`06:00`) the post-midnight hours belong to the same session that opened the evening before. Because the gate reads from the DB rather than in-memory state, it survives a scheduler restart mid-window. A successful manual `--service` run inside the window also counts, so the auto loop does not redundantly re-index a service an operator already handled that night.
 - **Background Work**: It can start batch jobs in the background so it can do more than one thing at a time.
 - **Sequential Execution (--sequence)**: If you prefer to run only one task at a time, use the `--sequence` flag to wait for the current job to finish before starting the next one.
 - **Concurrency Cap (MAX_CONCURRENT_JOBS)**: It limits the number of jobs that can run at the same time (default 3). This stops the server from being overloaded when several jobs finish the light "download" stage together and suddenly all start the heavy "indexing" stage. Applies to both the scheduled loop and `--service` manual triggers, and is race-safe across both paths.
@@ -202,10 +203,11 @@ Run these games to make sure the helper is working:
 ./tests/test_sigterm_cleanup.sh                  # Check if the helper cleans up on shutdown signal
 ./tests/test_error_skip.sh                       # Check FAILED/TIMEOUT jobs are excluded from next-job retry pool within the current run
 ./tests/test_dedup_by_run.sh                     # Check auto-cycle dedup is scoped to run_id, replacing the 23h rolling window
-./tests/test_failed_then_retry_next_cycle.sh     # Check a FAILED row in a closed prior run does not block re-dispatch in the next cycle
+./tests/test_failed_then_retry_next_cycle.sh     # Check a FAILED service is retried in a follow-on run while a service that already COMPLETED this session is NOT re-dispatched
+./tests/test_no_rerun_same_session.sh            # Check a service that COMPLETED is not re-run within the same window session (waits for next window); cross-midnight window-start boundary unit coverage
 ./tests/test_premature_run_close.sh              # Check natural-completion close defers while jobs are still RUNNING (no premature COMPLETED)
-./tests/test_service_added_mid_cycle.sh          # Check a service inserted mid-cycle joins the current run on the next iteration
-./tests/test_service_deactivated_mid_cycle.sh    # Check is_active=0 mid-cycle does not abort in-flight jobs and excludes from next cycle
+./tests/test_service_added_mid_cycle.sh          # Check a service inserted mid-cycle joins the current run; once COMPLETED it is not re-run the same session
+./tests/test_service_deactivated_mid_cycle.sh    # Check is_active=0 mid-cycle does not abort in-flight jobs and is never re-dispatched into a later cycle
 
 # Run Lifecycle (cycle-based history)
 ./tests/test_runs_schema.sh             # Check runs table + jobs.run_id migration is idempotent

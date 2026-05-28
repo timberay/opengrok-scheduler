@@ -44,6 +44,30 @@ check_time_range() {
     echo "false"; return 1
 }
 
+# Resolve the most recent working-window *start* boundary as a
+# 'YYYY-MM-DD HH:MM:SS' datetime, suitable for comparing against a run's
+# started_at column. Used to gate auto-run reopening to once per window
+# session: once a cycle completes within the current session, no new auto
+# run opens until the scheduler exits and re-enters the window (the next
+# night). Mirrors check_time_range's minute-of-day math so the two stay
+# consistent. For a cross-midnight window (e.g. 18:00->06:00), the post-
+# midnight "morning" part belongs to the PREVIOUS calendar day's session,
+# so the boundary is yesterday's START. Args: $1=START, $2=END,
+# $3=CURRENT (HH:MM, defaults to now — overridable for tests).
+current_window_start_dt() {
+    local START=$1
+    local END=$2
+    local CURRENT=${3:-$(date +%H:%M)}
+    local S_MIN=$(( $(date -d "$START" +%-H)*60 + $(date -d "$START" +%-M) ))
+    local E_MIN=$(( $(date -d "$END" +%-H)*60 + $(date -d "$END" +%-M) ))
+    local C_MIN=$(( $(date -d "$CURRENT" +%-H)*60 + $(date -d "$CURRENT" +%-M) ))
+    local DAY="today"
+    if [ "$S_MIN" -gt "$E_MIN" ] && [ "$C_MIN" -lt "$E_MIN" ]; then
+        DAY="yesterday"
+    fi
+    echo "$(date -d "$DAY" +%Y-%m-%d) $START:00"
+}
+
 # Subroutine to log to console and DB if needed
 log() {
     local LOG_FILE="$LOG_DIR/scheduler_$(date +%Y%m%d).log"
@@ -869,6 +893,44 @@ COMMIT;")
             fi
             log "Outside working hours ($START ~ $END). Sleeping..."
         else
+            # Per-service, once-per-session success gate.
+            #
+            # A service must run at least once per working-window session, and
+            # a service that has already SUCCEEDED (COMPLETED) within the
+            # current session must NOT run again until the next window — but a
+            # service that FAILED (or never finished) stays eligible to retry
+            # while we are still inside the window. PENDING counts active
+            # services that have no COMPLETED job since the window opened.
+            #
+            # When PENDING is 0 and no run is in flight, every active service
+            # has succeeded this session: the night's work is done, so we do
+            # NOT open a fresh run (which would otherwise re-dispatch everything
+            # — the user-reported "it runs again the same day" symptom). We wait
+            # for the next window entry instead. History-driven and DB-backed,
+            # so the decision survives a scheduler restart mid-window.
+            #
+            # COMPLETED jobs from any path count — including manual --service
+            # successes inside the window — so an operator-triggered success is
+            # not redundantly re-indexed by the auto loop the same night.
+            WINDOW_START=$(current_window_start_dt "$START" "$END")
+            PENDING=$($DB_QUERY "SELECT COUNT(*) FROM services s \
+WHERE s.is_active=1 \
+  AND NOT EXISTS (SELECT 1 FROM jobs j \
+                  WHERE j.service_id=s.id \
+                    AND j.status='COMPLETED' \
+                    AND j.start_time >= '$WINDOW_START');")
+            if ! [[ "$PENDING" =~ ^[0-9]+$ ]]; then
+                log "[Error] Failed to check pending-services state. Retrying in 30s..."
+                sleep 30
+                continue
+            fi
+            if [ "$PENDING" -eq 0 ] && [ -z "$(run_current_id)" ]; then
+                log "All active services completed for this window session (since $WINDOW_START). Waiting for next window..."
+                CURRENT_RUN_ID=""
+                sleep "$INTERVAL"
+                continue
+            fi
+
             # Idempotent: opens a new run only if none is currently RUNNING.
             CURRENT_RUN_ID=$(run_open_if_none auto)
             if [ -z "$CURRENT_RUN_ID" ]; then
@@ -877,7 +939,14 @@ COMMIT;")
                 continue
             fi
 
-            # 3. Get Next Job (Exclude services already attempted in this run)
+            # 3. Get Next Job. Two exclusions:
+            #    (a) per-run single-pass: skip services already attempted in
+            #        THIS run, so a service that failed in this run is not
+            #        instantly re-picked within the same run (retry happens via
+            #        the next run, paced by CHECK_INTERVAL);
+            #    (b) per-session success: skip services that already COMPLETED
+            #        since the window opened, so a successful service runs once
+            #        per session while a FAILED one stays eligible for retry.
             QUERY="SELECT s.id FROM services s
                    LEFT JOIN (
                        SELECT service_id, AVG(duration) as avg_duration
@@ -891,6 +960,12 @@ COMMIT;")
                        WHERE j.service_id = s.id
                        AND j.run_id = $CURRENT_RUN_ID
                    )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM jobs j
+                       WHERE j.service_id = s.id
+                       AND j.status='COMPLETED'
+                       AND j.start_time >= '$WINDOW_START'
+                   )
                    ORDER BY s.priority DESC, COALESCE(j_stats.avg_duration, -1) DESC, s.container_name ASC
                    LIMIT 1;"
             NEXT_SERVICE_ID=$($DB_QUERY "$QUERY")
@@ -901,23 +976,24 @@ COMMIT;")
             fi
             
             if [ -z "$NEXT_SERVICE_ID" ]; then
-                # Every active service has a row in this run. Close it COMPLETED
-                # only once nothing is still RUNNING — otherwise a fresh run
-                # would open on the next iteration and re-dispatch the same
-                # services as soon as their old background jobs finished
-                # (the user-visible "RUNNING → WAITING → re-run" bug).
+                # Nothing left to dispatch in this run: every active service
+                # either already has a row in this run or has already succeeded
+                # this session. Close the run COMPLETED only once nothing is
+                # still RUNNING — closing while a background job is in flight
+                # would let the next iteration's per-session gate re-evaluate
+                # against a not-yet-final job state. If a service FAILED this
+                # run, the per-session gate decides on the next iteration
+                # whether to open a retry run (still pending) or wait for the
+                # next window (all succeeded).
                 if [ -n "$CURRENT_RUN_ID" ]; then
                     if run_can_close_naturally "$CURRENT_RUN_ID"; then
-                        log "All tasks completed for run #$CURRENT_RUN_ID. Closing as COMPLETED."
+                        log "Run #$CURRENT_RUN_ID closed COMPLETED (all dispatched services reached a terminal status)."
                         run_close "$CURRENT_RUN_ID" COMPLETED
                         CURRENT_RUN_ID=""
-                        log "All tasks completed for today. Waiting..."
                     else
                         IN_FLIGHT=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE run_id=$CURRENT_RUN_ID AND status='RUNNING';")
                         log "All services dispatched in run #$CURRENT_RUN_ID; waiting for ${IN_FLIGHT:-?} in-flight job(s) to finish."
                     fi
-                else
-                    log "All tasks completed for today. Waiting..."
                 fi
             else
                 CONTAINER_NAME=$($DB_QUERY "SELECT container_name FROM services WHERE id=$NEXT_SERVICE_ID;")

@@ -19,17 +19,17 @@
 #      NEXT_SERVICE_ID query's per-run-dedup (NOT EXISTS row in this run)
 #      would already exclude it. is_active=0 has no incremental effect for
 #      svc-X inside the current run.
-#   3. When the current run closes and the next cycle opens, svc-X is NOT
-#      dispatched (filtered by WHERE s.is_active=1 in NEXT_SERVICE_ID).
-#   4. runs.total_services snapshot in the next run reflects the now-current
-#      active count (1 less).
+#   3. A deactivated service is never re-dispatched. (When a later cycle does
+#      open — e.g. to retry a still-pending service — it is filtered by
+#      WHERE s.is_active=1 in NEXT_SERVICE_ID; see C2c for the within-run case.)
 #
 # Edge cases covered:
 #   C2a — In-flight RUNNING job is not aborted by deactivation. Completes
 #         normally as COMPLETED.
-#   C2b — In the next cycle, the deactivated service is NOT dispatched, and
-#         the snapshot of total_services for that next run reflects the
-#         lowered active count.
+#   C2b — A deactivated service is not resurrected into a later cycle. Here
+#         both services COMPLETED this session, so the per-service success
+#         gate keeps the loop idle (no follow-on run) and svc-alpha is never
+#         re-dispatched.
 #   C2c — Service deactivated AFTER run open but BEFORE its turn to dispatch.
 #         The run's total_services snapshot was taken at open time and still
 #         counts the (then-active) service. NEXT_SERVICE_ID filters it out
@@ -186,41 +186,22 @@ fi
 R1_COMPLETED=$($DB_QUERY "SELECT completed_count FROM runs WHERE id=$R1;")
 assert_eq "C2a: run #$R1 completed_count = 2 (both rows aggregated)" "2" "$R1_COMPLETED"
 
-# --- C2b: next cycle ---
-# Wait for run #2 to open. svc-alpha is now is_active=0 so it must NOT be
-# dispatched in run #2; only svc-beta is eligible.
-DEADLINE=$(( $(date +%s) + 25 ))
-R2=""
-while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-    R2=$($DB_QUERY "SELECT id FROM runs WHERE id > $R1 AND status IN ('RUNNING','COMPLETED') ORDER BY id ASC LIMIT 1;")
-    [ -n "$R2" ] && break
-    sleep 1
-done
+# --- C2b: deactivated service is not resurrected into a later cycle ---
+# Both svc-alpha and svc-beta COMPLETED in run #1, and svc-alpha is now
+# is_active=0. Per the per-service success gate, neither completed service
+# may re-run this session, so NO follow-on run opens — and the deactivated
+# svc-alpha is certainly never re-dispatched. (Within-run exclusion of a
+# deactivated service is covered separately by C2c.)
+sleep 8
 
-if [ -n "$R2" ]; then
-    pass "C2b: run #$R2 opened after run #$R1 closed"
-else
-    fail "C2b: no follow-on run opened within 25s"
-fi
+NEW_RUNS=$($DB_QUERY "SELECT COUNT(*) FROM runs WHERE id > $R1;")
+assert_eq "C2b: no follow-on run opens after both services completed this session" "0" "$NEW_RUNS"
 
-# The snapshot at run #2 open should reflect the now-current active count: 1.
-if [ -n "$R2" ]; then
-    R2_TOTAL=$($DB_QUERY "SELECT total_services FROM runs WHERE id=$R2;")
-    assert_eq "C2b: run #$R2 total_services snapshot = 1 (deactivated svc-alpha not counted)" "1" "$R2_TOTAL"
-fi
+ALPHA_JOBS=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE service_id=$ALPHA_ID;")
+assert_eq "C2b: deactivated svc-alpha not re-dispatched (single run #1 row only)" "1" "$ALPHA_JOBS"
 
-# svc-beta participates in run #2.
-if [ -n "$R2" ] && poll_db "SELECT COUNT(*) FROM jobs WHERE service_id=$BETA_ID AND run_id=$R2;" "1" 25 "svc-beta gets a row in run #$R2"; then
-    pass "C2b: svc-beta dispatched in run #$R2"
-else
-    fail "C2b: svc-beta did not get a row in run #$R2"
-fi
-
-# Give the loop several iterations to (potentially incorrectly) dispatch
-# svc-alpha. Then assert it has NO row in run #2.
-sleep 6
-ALPHA_IN_R2=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE service_id=$ALPHA_ID AND run_id=$R2;")
-assert_eq "C2b: deactivated svc-alpha has NO row in run #$R2" "0" "$ALPHA_IN_R2"
+BETA_JOBS=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE service_id=$BETA_ID;")
+assert_eq "C2b: completed svc-beta not re-dispatched this session" "1" "$BETA_JOBS"
 
 stop_scheduler
 cleanup_test_db "$TEST_DB"

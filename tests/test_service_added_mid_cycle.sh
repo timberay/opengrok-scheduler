@@ -25,8 +25,9 @@
 #         the original value. completed_count reflects the actual total.
 #   C1b — Newly INACTIVE (is_active=0) service added mid-cycle is ignored;
 #         never gets a row in run #1.
-#   C1c — Mid-cycle-added service survives across cycles: it participates
-#         in run #2 the same as the originally-seeded services.
+#   C1c — Mid-cycle-added service is a first-class citizen: once COMPLETED it
+#         is treated exactly like the seeded services and is NOT re-run within
+#         the same session. With all services succeeded, no run #2 opens.
 
 set -u
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
@@ -172,41 +173,27 @@ JOB_COUNT_IN_RUN=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE run_id=$R1;")
 assert_eq "C1a: no duplicate jobs in run #$R1 (one row per service)" "3" "$JOB_COUNT_IN_RUN"
 
 # ---------------------------------------------------------------------------
-# C1c — The mid-cycle-added service participates in the NEXT cycle too.
-# (Done before tearing the scheduler down so we exercise the same long-lived
-# loop that observed the mid-cycle INSERT.)
+# C1c — The mid-cycle-added service is a first-class citizen: once it has
+# COMPLETED it is treated exactly like the originally-seeded services and is
+# NOT re-run within the same window session. Since all three services
+# succeeded in run #1, the per-service success gate must keep the loop idle —
+# no run #2 opens — until the next window. (Checked while the same long-lived
+# loop that observed the mid-cycle INSERT is still alive.)
 # ---------------------------------------------------------------------------
-echo "--- C1c: svc-gamma participates in run #2 ---"
+echo "--- C1c: svc-gamma does not re-run after completing (per-session gate) ---"
 
-# Wait for the scheduler to open a fresh run after run #1 closed COMPLETED.
-# Because the window is wide open (00:00-23:59), the very next iteration
-# will call run_open_if_none and create R2.
-DEADLINE=$(( $(date +%s) + 20 ))
-R2=""
-while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-    R2=$($DB_QUERY "SELECT id FROM runs WHERE id > $R1 AND status IN ('RUNNING','COMPLETED') ORDER BY id ASC LIMIT 1;")
-    [ -n "$R2" ] && break
-    sleep 1
-done
+# Let the loop tick well past run #1's close (CHECK_INTERVAL=1). The buggy
+# path would open run #2 and re-dispatch all three services here.
+sleep 12
 
-if [ -n "$R2" ]; then
-    pass "C1c: run #$R2 opened cleanly after run #$R1 closed"
-else
-    fail "C1c: no run #2 opened within 20s after run #1 closed"
-fi
+NEW_RUN=$($DB_QUERY "SELECT COUNT(*) FROM runs WHERE id > $R1;")
+assert_eq "C1c: no new run opens after all services completed this session" "0" "$NEW_RUN"
 
-# svc-gamma must get a row in run #2 (re-eligibility under per-run dedup).
-if [ -n "$R2" ] && poll_db "SELECT COUNT(*) FROM jobs WHERE service_id=$GAMMA_ID AND run_id=$R2;" "1" 25 "svc-gamma participates in run #$R2"; then
-    pass "C1c: svc-gamma got a row in run #$R2 (mid-cycle add survives across cycles)"
-else
-    fail "C1c: svc-gamma did not get a row in run #$R2"
-fi
+GAMMA_JOBS=$($DB_QUERY "SELECT COUNT(*) FROM jobs WHERE service_id=$GAMMA_ID;")
+assert_eq "C1c: svc-gamma not re-dispatched (exactly one job, same as seeded svcs)" "1" "$GAMMA_JOBS"
 
-# And total_services in run #2 reflects the current active count (3).
-if [ -n "$R2" ]; then
-    R2_TOTAL=$($DB_QUERY "SELECT total_services FROM runs WHERE id=$R2;")
-    assert_eq "C1c: run #2 total_services snapshot reflects current count (3)" "3" "$R2_TOTAL"
-fi
+TOTAL_RUNS=$($DB_QUERY "SELECT COUNT(*) FROM runs;")
+assert_eq "C1c: still exactly one run for the session" "1" "$TOTAL_RUNS"
 
 # Stop the scheduler.
 if kill -0 "$SCHED_PID" 2>/dev/null; then
